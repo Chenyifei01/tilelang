@@ -2,7 +2,7 @@
 
 Design: ``embedding_lookup/design.md``. Pure AIV kernel on the persistent
 execution model: a fixed grid iterates work tiles (``T.Persistent``), each
-tile runs a token-granularity double-buffered row pipeline (``T.Pipelined``).
+tile runs a token-granularity multi-buffered row pipeline (``T.Pipelined``).
 Loads and stores are unconditional with respect to hit/miss; only the miss
 zero-fill is a conditional V-pipe op -- conditionally dispatched MTE stores
 are unsound under the auto-scheduler (design.md §9.1 S6), so do not
@@ -19,8 +19,10 @@ from tilelang.profiler import do_bench
 # Measured AIV count on Ascend 950DT (design.md §1.4); the persistent grid is
 # additionally capped by the tile count, so tiny batches shrink the grid.
 NUM_AIV = 56
-# row_ub double buffering is the whole UB budget (design.md §4.2).
-ROW_UB_BUDGET = 128 * 1024
+# Verified-working UB envelope for row_ub versioning (design.md §6.3 T1 sweep:
+# allocations up to 192 KiB compile and run; the ~216 KiB hardware limit leaves
+# headroom for ids_ub and scheduler reservations).
+UB_PLAN = 192 * 1024
 
 _DTYPE_STR = {
     torch.bfloat16: "bfloat16",
@@ -28,6 +30,30 @@ _DTYPE_STR = {
     torch.float32: "float32",
 }
 _STR_TO_TORCH = {v: k for k, v in _DTYPE_STR.items()}
+
+
+def _tile_config(H, esize):
+    """(tile_t, versions, num_stages) for the row pipeline (design.md §6.3 T1).
+
+    T1 sweep optimum on 950DT: tile_t 3-4 with 3-4 versions/stages dominates
+    both row classes (2672 GB/s @H=7168, 2603 GB/s @H=4096); deeper tile_t or
+    stages plateau or regress. Non-32B row bytes force single-row tiles (S8).
+    """
+    row = H * esize
+    if row % 32 != 0:
+        return 1, 2, 2
+    if row >= 12 * 1024:
+        tile_t = 3
+    elif row >= 4 * 1024:
+        tile_t = 4
+    else:
+        tile_t = 8
+    versions = UB_PLAN // (tile_t * row)
+    if versions < 2:  # shrink tile_t rather than lose double buffering
+        tile_t = max(1, UB_PLAN // (2 * row))
+        versions = 2
+    versions = min(4, versions)
+    return tile_t, versions, versions
 
 
 def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
@@ -39,13 +65,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
     """
     assert num_tokens > 0 and shard_rows > 0 and H > 0
     esize = 2 if dtype in ("bfloat16", "float16") else 4
-    tile_t = max(1, min(8, ROW_UB_BUDGET // (2 * H * esize)))
-    if (H * esize) % 32 != 0:
-        # Non-32B row bytes: multi-row pitched DMA (tile_t >= 2) faults the
-        # device at runtime in both MTE directions (device error 507035;
-        # 4094/4095 x tt2/4/8 all fault, tt1 and 32B-aligned rows pass).
-        # Degrade to single-row tiles, which carry no cross-row pitch.
-        tile_t = 1
+    tile_t, versions, num_stages = _tile_config(H, esize)
     num_tiles = (num_tokens + tile_t - 1) // tile_t
     num_cores = min(NUM_AIV, num_tiles)
 
@@ -60,7 +80,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
         with T.Kernel(num_cores) as core_id:
             ids_ub = T.alloc_shared((tile_t,), "int32")
             row_ub = T.alloc_shared((tile_t, H), dtype)
-            T.annotate_buffer_versions({row_ub: 2})
+            T.annotate_buffer_versions({row_ub: versions})
             for tile in T.Persistent([num_tiles], num_cores, core_id):
                 t0 = tile * tile_t
                 # Static full-width id tile: the copy planner requires provably
@@ -68,7 +88,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                 # out-of-range lanes are clamped by the planner and masked by
                 # the guard below.
                 T.copy(Ids[t0 : t0 + tile_t], ids_ub)
-                for i in T.Pipelined(tile_t, num_stages=2):
+                for i in T.Pipelined(tile_t, num_stages=num_stages):
                     tk = t0 + i
                     if tk < num_tokens:  # tail-tile guard
                         tok_id = ids_ub[i]
@@ -79,7 +99,13 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                         # conditionally on hit/miss -- unsound, design.md §9.1 S6.
                         T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
                         if not hit:  # miss: zero the row (V pipe)
-                            T.fill(row_ub[i, :], T.cast(0, dtype))
+                            # Vectorized SimtVF store -- the T.fill lowering runs
+                            # at ~85 GB/s aggregate and alone made the miss path
+                            # 10x the hit path (design.md §9.1 S9/S10); the VF
+                            # store runs at write-bound speed.
+                            with T.SimtVF(threads=128):
+                                for j in T.Parallel(H):
+                                    row_ub[i, j] = T.cast(0, dtype)
                         T.copy(row_ub[i, :], Out[tk, :])
 
     return main
