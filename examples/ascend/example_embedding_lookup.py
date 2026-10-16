@@ -3,10 +3,12 @@
 Design: ``embedding_lookup/design.md``. Pure AIV kernel on the persistent
 execution model: a fixed grid iterates work tiles (``T.Persistent``), each
 tile runs a token-granularity multi-buffered row pipeline (``T.Pipelined``).
-Loads and stores are unconditional with respect to hit/miss; only the miss
-zero-fill is a conditional V-pipe op -- conditionally dispatched MTE stores
-are unsound under the auto-scheduler (design.md §9.1 S6), so do not
-reintroduce them.
+When ``num_tokens`` is divisible by ``tile_t`` (compile-time) the tile's rows
+leave in one block MTE3 (stream-copy transaction shape, design.md §6.3 T8);
+otherwise rows store per-row under a tail guard. Loads and stores are
+unconditional with respect to hit/miss; only the miss zero-fill is a
+conditional V-pipe op -- conditionally dispatched MTE stores are unsound
+under the auto-scheduler (design.md §9.1 S6), so do not reintroduce them.
 """
 
 import argparse
@@ -33,27 +35,27 @@ _STR_TO_TORCH = {v: k for k, v in _DTYPE_STR.items()}
 
 
 def _tile_config(H, esize):
-    """(tile_t, versions, num_stages) for the row pipeline (design.md §6.3 T1).
+    """(tile_t, versions, num_stages) for the row pipeline (design.md §6.3 T1/T8).
 
-    T1 sweep optimum on 950DT: tile_t 3-4 with 3-4 versions/stages dominates
-    both row classes (2672 GB/s @H=7168, 2603 GB/s @H=4096); deeper tile_t or
-    stages plateau or regress. Non-32B row bytes force single-row tiles (S8).
+    Swept optima on 950DT with the block-store fast path: row classes
+    (>=12 KiB -> tt4/v3: 2843 GB/s; 4-12 KiB -> tt8/v2: 3038 GB/s -- above the
+    stream-copy baseline); small rows keep a deeper pipeline (tt8/v4). The
+    budget guard shrinks tile_t rather than lose double buffering (fp32 rows).
+    Non-32B row bytes force single-row tiles (S8).
     """
     row = H * esize
     if row % 32 != 0:
         return 1, 2, 2
     if row >= 12 * 1024:
-        tile_t = 3
+        tile_t, versions, num_stages = 4, 3, 3
     elif row >= 4 * 1024:
-        tile_t = 4
+        tile_t, versions, num_stages = 8, 2, 2
     else:
-        tile_t = 8
-    versions = UB_PLAN // (tile_t * row)
-    if versions < 2:  # shrink tile_t rather than lose double buffering
+        tile_t, versions, num_stages = 8, 4, 4
+    if tile_t * row * versions > UB_PLAN:  # e.g. fp32 H=7168: keep (tile_t,2)
         tile_t = max(1, UB_PLAN // (2 * row))
-        versions = 2
-    versions = min(4, versions)
-    return tile_t, versions, versions
+        versions, num_stages = 2, 2
+    return tile_t, versions, num_stages
 
 
 def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
@@ -61,11 +63,15 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
 
     ``num_tokens``/``shard_rows``/``H``/``dtype`` are compile-time specialized;
     ``vocab_start``/``vocab_end`` stay runtime scalars so one binary serves all
-    TP sharding configs.
+    TP sharding configs. When ``num_tokens`` is divisible by ``tile_t`` the
+    tail guard is compile-time dead and the tile's rows leave in one block
+    MTE3 (T8: +6% at H=7168, +16% at H=4096 over the per-row store); otherwise
+    the per-row store path is used.
     """
     assert num_tokens > 0 and shard_rows > 0 and H > 0
     esize = 2 if dtype in ("bfloat16", "float16") else 4
     tile_t, versions, num_stages = _tile_config(H, esize)
+    block_store = num_tokens % tile_t == 0  # no tail tile: block MTE3 is safe
     num_tiles = (num_tokens + tile_t - 1) // tile_t
     num_cores = min(NUM_AIV, num_tiles)
 
@@ -88,25 +94,31 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                 # out-of-range lanes are clamped by the planner and masked by
                 # the guard below.
                 T.copy(Ids[t0 : t0 + tile_t], ids_ub)
-                for i in T.Pipelined(tile_t, num_stages=num_stages):
-                    tk = t0 + i
-                    if tk < num_tokens:  # tail-tile guard
+                if block_store:
+                    for i in T.Pipelined(tile_t, num_stages=num_stages):
                         tok_id = ids_ub[i]
                         local = tok_id - vocab_start
                         hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
-                        # Unconditional clamped load: a miss only reads row
-                        # 0/last (L2-resident). Do not dispatch the MTE store
-                        # conditionally on hit/miss -- unsound, design.md §9.1 S6.
                         T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
-                        if not hit:  # miss: zero the row (V pipe)
-                            # Vectorized SimtVF store -- the T.fill lowering runs
-                            # at ~85 GB/s aggregate and alone made the miss path
-                            # 10x the hit path (design.md §9.1 S9/S10); the VF
-                            # store runs at write-bound speed.
+                        if not hit:  # miss: vectorized zero (V pipe)
                             with T.SimtVF(threads=128):
                                 for j in T.Parallel(H):
                                     row_ub[i, j] = T.cast(0, dtype)
-                        T.copy(row_ub[i, :], Out[tk, :])
+                    # one block store for the whole tile (tile_t*H contiguous)
+                    T.copy(row_ub, Out[t0 : t0 + tile_t, :])
+                else:
+                    for i in T.Pipelined(tile_t, num_stages=num_stages):
+                        tk = t0 + i
+                        if tk < num_tokens:  # tail-tile guard
+                            tok_id = ids_ub[i]
+                            local = tok_id - vocab_start
+                            hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
+                            T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
+                            if not hit:  # miss: vectorized zero (V pipe)
+                                with T.SimtVF(threads=128):
+                                    for j in T.Parallel(H):
+                                        row_ub[i, j] = T.cast(0, dtype)
+                            T.copy(row_ub[i, :], Out[tk, :])
 
     return main
 
