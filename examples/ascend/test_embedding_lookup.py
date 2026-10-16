@@ -150,15 +150,19 @@ def test_c9_compile_cache_reuse():
 
 
 @tilelang.testing.requires_ascend
-@pytest.mark.parametrize("H", [256, 7168])
-def test_c10_repeat_compile_regression(H, monkeypatch):
+@pytest.mark.parametrize(
+    "H, nt", [(256, 64), (7168, 64), (7168, 66)]  # 64: block store at both H; 66: per-row tail guard
+)
+def test_c10_repeat_compile_regression(H, nt, monkeypatch):
     """Gate against schedule variance (design.md §8.1 C10 / §9.1 S6): repeated
     compiles of the same source must all be bit-exact; the per-compile source
-    hash is recorded so a failure attributes to a specific binary. The kernel
-    disk cache is disabled so every rep is a genuine recompile -- with the
-    cache on, reps 2+ would be cache hits and gate nothing."""
+    hash is recorded so a failure attributes to a specific binary. Covers both
+    store paths (design.md §4.3): nt divisible by tile_t -> block store, else
+    per-row with the tail guard active. The kernel disk cache is disabled so
+    every rep is a genuine recompile -- with the cache on, reps 2+ would be
+    cache hits and gate nothing."""
     monkeypatch.setenv("TILELANG_DISABLE_CACHE", "1")
-    nt, shard_rows, vocab, vocab_start, vocab_end = 64, 16, 32, 3, 19
+    shard_rows, vocab, vocab_start, vocab_end = 16, 32, 3, 19
     for rep in range(3):
         kern = tilelang.compile(
             embedding_lookup_fwd(nt, shard_rows, H), out_idx=[2], target="ascend"
@@ -171,6 +175,6 @@ def test_c10_repeat_compile_regression(H, monkeypatch):
             out = kern(ids, w, vocab_start, vocab_end)
             torch.npu.synchronize()
             assert out.cpu().equal(ref_program(ids, w, vocab_start, vocab_end).cpu()), (
-                f"H={H} rep={rep} src_hash={src_hash} run={r}"
+                f"H={H} nt={nt} rep={rep} src_hash={src_hash} run={r}"
             )
-        print(f"C10 H={H} rep={rep}: src_hash={src_hash} 3/3 bit-exact")
+        print(f"C10 H={H} nt={nt} rep={rep}: src_hash={src_hash} 3/3 bit-exact")
