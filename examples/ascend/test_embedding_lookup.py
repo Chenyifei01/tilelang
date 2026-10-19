@@ -1,6 +1,6 @@
 """Correctness tests for the vocab-parallel embedding lookup example.
 
-Cases map to ``embedding_lookup/design.md`` §8.1 (C1-C10). Comparisons are
+Cases map to ``embedding_lookup/design.md`` §8.1 (C1-C13). Comparisons are
 bit-exact via ``torch.equal`` unless noted (design.md §5: gather is pure
 address movement, no rounding).
 """
@@ -13,6 +13,8 @@ import tilelang
 import tilelang.testing
 
 from example_embedding_lookup import (
+    UB_PLAN,
+    _tile_config,
     embedding_lookup,
     embedding_lookup_fwd,
     embedding_lookup_kernel,
@@ -178,3 +180,54 @@ def test_c10_repeat_compile_regression(H, nt, monkeypatch):
                 f"H={H} nt={nt} rep={rep} src_hash={src_hash} run={r}"
             )
         print(f"C10 H={H} nt={nt} rep={rep}: src_hash={src_hash} 3/3 bit-exact")
+
+
+@tilelang.testing.requires_ascend
+def test_c11_persistent_multi_wave():
+    """num_tiles > num_cores: the persistent outer loop wraps waves (production
+    runs 8192 tiles / 56 cores = 146 waves; C1-C10 never exceed one wave).
+    nt=1024 at tile_t=8 gives 128 tiles on 56 cores -- 16 cores take 3 tiles,
+    40 take 2 (uneven distribution exercised). Mixed both-side misses."""
+    vocab, shard_rows, vocab_start, vocab_end, H, nt = 64, 48, 8, 56, 64, 1024
+    ids = _rand_ids(nt, vocab, seed=19)
+    w = _rand_weight(shard_rows, H, seed=20)
+    out = embedding_lookup(ids, w, vocab_start, vocab_end)
+    assert torch.equal(out, ref_program(ids, w, vocab_start, vocab_end))
+
+
+def test_c12_tile_config_table():
+    """_tile_config is correctness-critical (UB capacity) and host-only, so the
+    documented table (design.md §4.2) is asserted directly, plus two invariants:
+    every config fits UB_PLAN, and non-32B rows force single-row tiles."""
+    assert _tile_config(7168, 2) == (4, 3, 3)  # V4-Pro bf16
+    assert _tile_config(4096, 2) == (8, 2, 2)  # V4-Flash bf16
+    assert _tile_config(4080, 2) == (8, 2, 2)  # aligned odd H, 4-12 KiB class
+    assert _tile_config(256, 2) == (8, 4, 4)
+    assert _tile_config(64, 2) == (8, 4, 4)
+    assert _tile_config(4095, 2) == (1, 2, 2)  # non-32B rows: single-row tiles
+    assert _tile_config(7168, 4) == (3, 2, 2)  # budget guard shrinks fp32 rows
+    assert _tile_config(4096, 4) == (4, 3, 3)  # exactly at the 192 KiB budget
+    for H in [1, 15, 64, 255, 256, 1024, 2048, 3584, 4080, 4095, 4096, 7168, 8192]:
+        for esize in [2, 4]:
+            tile_t, versions, num_stages = _tile_config(H, esize)
+            row = H * esize
+            assert versions >= 2 and num_stages == versions
+            assert tile_t * row * versions <= UB_PLAN, (H, esize)
+            if row % 32 != 0:
+                assert tile_t == 1, (H, esize)
+
+
+def test_c13_wrapper_contract_rejects():
+    """Caller contract enforcement (design.md §3.2): non-contiguous weight,
+    vocab_end mismatch, and unsupported dtypes must raise before any launch."""
+    H = 256
+    w = torch.randn(16, H, device="npu").to(torch.bfloat16)
+    ids = _rand_ids(8, 32, seed=21)
+    with pytest.raises(AssertionError):
+        embedding_lookup(ids, w[:, ::2], 0, 16)  # non-contiguous weight
+    with pytest.raises(AssertionError):
+        embedding_lookup(ids, w, 0, 100)  # vocab_end != vocab_start + shard_rows
+    with pytest.raises(TypeError):
+        # int table: unsupported dtype rejected. (torch.float64 is silently cast
+        # to float32 by the NPU device itself, so it cannot probe this path.)
+        embedding_lookup(ids, w.to(torch.int32), 0, 16)
