@@ -5,9 +5,12 @@ execution model: a fixed grid iterates work tiles (``T.Persistent``), each
 tile runs a token-granularity multi-buffered row pipeline (``T.Pipelined``).
 When ``num_tokens`` is divisible by ``tile_t`` (compile-time) the tile's rows
 leave in one block MTE3 (stream-copy transaction shape, design.md §6.3 T8);
-otherwise rows store per-row under a tail guard. Loads and stores are
-unconditional with respect to hit/miss; only the miss zero-fill is a
-conditional V-pipe op -- conditionally dispatched MTE stores are unsound
+otherwise rows store per-row under a tail guard. For 4-12 KiB rows (the
+V4-Flash class) the miss load is skipped -- a miss row is clamped to an
+L2-resident row and then zeroed, so the read is pure waste; measured -39% at
+TP=8 with TP=1 neutral (design.md §6.3 T9). For >=12 KiB rows the skip is not
+enabled: it regresses TP=1 by ~20% and gains only ~3% at TP=8. Stores remain
+unconditional with respect to hit/miss; conditional MTE *stores* are unsound
 under the auto-scheduler (design.md §9.1 S6), so do not reintroduce them.
 """
 
@@ -80,6 +83,11 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
     assert num_tokens > 0 and shard_rows > 0 and H > 0
     esize = 2 if dtype in ("bfloat16", "float16") else 4
     tile_t, versions, num_stages = _tile_config(H, esize)
+    # A miss reads a clamped L2-resident row and then zeroes it: the read is
+    # waste. Skipping it pays off only for 4-12 KiB rows, where the fill/store
+    # pipeline can still overlap (-39% at H=4096 TP=8, neutral at TP=1). For
+    # >=12 KiB rows it regresses TP=1 by ~20% and gains ~3% at TP=8.
+    skip_miss_load = 4 * 1024 <= H * esize < 12 * 1024
     block_store = num_tokens % tile_t == 0  # no tail tile: block MTE3 is safe
     num_tiles = (num_tokens + tile_t - 1) // tile_t
     num_cores = min(get_num_vector_cores(), num_tiles)
@@ -108,7 +116,11 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                         tok_id = ids_ub[i]
                         local = tok_id - vocab_start
                         hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
-                        T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
+                        if skip_miss_load:  # 4-12 KiB rows: miss read is waste
+                            if hit:
+                                T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
+                        else:
+                            T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
                         if not hit:  # miss: vectorized zero (V pipe)
                             with T.SimtVF(threads=128):
                                 for j in T.Parallel(H):
@@ -122,7 +134,11 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                             tok_id = ids_ub[i]
                             local = tok_id - vocab_start
                             hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
-                            T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
+                            if skip_miss_load:  # 4-12 KiB rows: miss read is waste
+                                if hit:
+                                    T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
+                            else:
+                                T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
                             if not hit:  # miss: vectorized zero (V pipe)
                                 with T.SimtVF(threads=128):
                                     for j in T.Parallel(H):
