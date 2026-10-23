@@ -16,11 +16,9 @@ import argparse
 import torch
 import tilelang
 import tilelang.ascend.language as T
+from tilelang.carver.arch.driver import get_num_vector_cores
 from tilelang.profiler import do_bench
 
-# Measured AIV count on Ascend 950DT (design.md §1.4); the persistent grid is
-# additionally capped by the tile count, so tiny batches shrink the grid.
-NUM_AIV = 56
 # Verified-working UB envelope for row_ub versioning (design.md §6.3 T1 sweep:
 # allocations up to 192 KiB compile and run; the ~216 KiB hardware limit leaves
 # headroom for ids_ub and scheduler reservations).
@@ -58,22 +56,27 @@ def _tile_config(H, esize):
     return tile_t, versions, num_stages
 
 
+@tilelang.jit(out_idx=[2], target="ascend")
 def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
-    """Build the kernel prim_func (design.md §4.3).
+    """JIT-cached kernel per compile-time signature (design.md §3.1, §4.3).
 
     ``num_tokens``/``shard_rows``/``H``/``dtype`` are compile-time specialized;
     ``vocab_start``/``vocab_end`` stay runtime scalars so one binary serves all
-    TP sharding configs. When ``num_tokens`` is divisible by ``tile_t`` the
-    tail guard is compile-time dead and the tile's rows leave in one block
-    MTE3 (T8: +6% at H=7168, +16% at H=4096 over the per-row store); otherwise
-    the per-row store path is used.
+    TP sharding configs. The persistent grid is capped by the tile count, so
+    tiny batches shrink the grid. The AIV count is queried from the device
+    (950DT/950PR etc. differ) instead of being hard-coded.
+
+    When ``num_tokens`` is divisible by ``tile_t`` the tail guard is
+    compile-time dead and the tile's rows leave in one block MTE3 (T8: +6% at
+    H=7168, +16% at H=4096 over the per-row store); otherwise the per-row
+    store path is used.
     """
     assert num_tokens > 0 and shard_rows > 0 and H > 0
     esize = 2 if dtype in ("bfloat16", "float16") else 4
     tile_t, versions, num_stages = _tile_config(H, esize)
     block_store = num_tokens % tile_t == 0  # no tail tile: block MTE3 is safe
     num_tiles = (num_tokens + tile_t - 1) // tile_t
-    num_cores = min(NUM_AIV, num_tiles)
+    num_cores = min(get_num_vector_cores(), num_tiles)
 
     @T.prim_func
     def main(
@@ -123,12 +126,6 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
     return main
 
 
-@tilelang.jit(out_idx=[2], target="ascend")
-def embedding_lookup_kernel(num_tokens, shard_rows, H, dtype="bfloat16"):
-    """JIT-cached kernel per compile-time signature (design.md §3.1)."""
-    return embedding_lookup_fwd(num_tokens, shard_rows, H, dtype)
-
-
 def ref_program(ids, weight, vocab_start, vocab_end):
     """Golden: ids outside [vocab_start, vocab_end) produce zero rows."""
     mask = (ids >= vocab_start) & (ids < vocab_end)
@@ -167,7 +164,7 @@ def embedding_lookup(
         ids = ids.to(torch.int32)
     if ids.numel() == 0:  # wrapper short-circuit, no kernel launch (design.md §4.4)
         return torch.empty(orig_shape + (H,), device=weight.device, dtype=weight.dtype)
-    kernel = embedding_lookup_kernel(ids.numel(), shard_rows, H, dtype)
+    kernel = embedding_lookup_fwd(ids.numel(), shard_rows, H, dtype)
     out = kernel(ids, weight, vocab_start_index, vocab_end_index)
     torch.npu.synchronize()
     return out.reshape(orig_shape + (H,))
@@ -175,9 +172,7 @@ def embedding_lookup(
 
 def run_regression_perf(num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=129280):
     """Full-table (TP=1) bandwidth regression (design.md §6.1/§8.2)."""
-    kernel = tilelang.compile(
-        embedding_lookup_fwd(num_tokens, vocab_size, H, dtype), out_idx=[2], target="ascend"
-    )
+    kernel = embedding_lookup_fwd(num_tokens, vocab_size, H, dtype)
     ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int32).npu()
     w = torch.randn(vocab_size, H, device="npu").to(_STR_TO_TORCH[dtype])
     latency = do_bench(

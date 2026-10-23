@@ -17,7 +17,6 @@ from example_embedding_lookup import (
     _tile_config,
     embedding_lookup,
     embedding_lookup_fwd,
-    embedding_lookup_kernel,
     ref_program,
 )
 
@@ -140,8 +139,8 @@ def test_c8_2d_ids_interface():
 def test_c9_compile_cache_reuse():
     """MTP-style double lookup reuses the cached kernel, no recompile (design.md C9)."""
     nt, shard_rows, H = 32, 16, 128
-    k1 = embedding_lookup_kernel(nt, shard_rows, H, "bfloat16")
-    k2 = embedding_lookup_kernel(nt, shard_rows, H, "bfloat16")
+    k1 = embedding_lookup_fwd(nt, shard_rows, H, "bfloat16")
+    k2 = embedding_lookup_fwd(nt, shard_rows, H, "bfloat16")
     assert k1 is k2
     ids = _rand_ids(nt, 32, seed=17)
     w = _rand_weight(shard_rows, H, seed=18)
@@ -166,8 +165,10 @@ def test_c10_repeat_compile_regression(H, nt, monkeypatch):
     monkeypatch.setenv("TILELANG_DISABLE_CACHE", "1")
     shard_rows, vocab, vocab_start, vocab_end = 16, 32, 3, 19
     for rep in range(3):
+        # ``get_tir`` bypasses the JIT builder's in-memory kernel cache, so each
+        # rep is a genuine frontend + compile (the disk cache is disabled above).
         kern = tilelang.compile(
-            embedding_lookup_fwd(nt, shard_rows, H), out_idx=[2], target="ascend"
+            embedding_lookup_fwd.get_tir(nt, shard_rows, H), out_idx=[2], target="ascend"
         )
         src_hash = hashlib.sha256(kern.get_kernel_source().encode()).hexdigest()[:12]
         for r in range(3):
