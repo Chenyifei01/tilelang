@@ -19,10 +19,14 @@ import tilelang.ascend.language as T
 from tilelang.carver.arch.driver import get_num_vector_cores
 from tilelang.profiler import do_bench
 
-# Verified-working UB envelope for row_ub versioning (design.md §6.3 T1 sweep:
-# allocations up to 192 KiB compile and run; the ~216 KiB hardware limit leaves
-# headroom for ids_ub and scheduler reservations).
-UB_PLAN = 192 * 1024
+# Ascend 950 physical UB is 248 KiB (src/ascend/transform/auto_schedule.cc,
+# kPhysicalUnifiedBufferSize). A kernel containing T.SimtVF loses 32 KiB to the
+# VF thread context (kSimtVFThreadContextSize), so the scheduler's shared-memory
+# limit here is 216 KiB; plan at that limit. (Measured boundary: (4,3)@H=7168 =
+# 168 KiB compiles, (4,4) = 224 KiB fails with capacity -8192 B.)
+UB_PHYSICAL = 248 * 1024
+SIMT_VF_CONTEXT = 32 * 1024
+UB_PLAN = UB_PHYSICAL - SIMT_VF_CONTEXT  # 216 KiB
 
 _DTYPE_STR = {
     torch.bfloat16: "bfloat16",
@@ -38,7 +42,9 @@ def _tile_config(H, esize):
     Swept optima on 950DT with the block-store fast path: row classes
     (>=12 KiB -> tt4/v3: 2843 GB/s; 4-12 KiB -> tt8/v2: 3038 GB/s -- above the
     stream-copy baseline); small rows keep a deeper pipeline (tt8/v4). The
-    budget guard shrinks tile_t rather than lose double buffering (fp32 rows).
+    budget guard shrinks tile_t rather than lose double buffering (fp32 rows);
+    the budget is the scheduler's 216 KiB (248 KiB physical minus the 32 KiB
+    SimtVF thread context), not the raw physical size.
     Non-32B row bytes force single-row tiles (S8).
     """
     row = H * esize

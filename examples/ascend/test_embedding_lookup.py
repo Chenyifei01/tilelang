@@ -13,6 +13,8 @@ import tilelang
 import tilelang.testing
 
 from example_embedding_lookup import (
+    SIMT_VF_CONTEXT,
+    UB_PHYSICAL,
     UB_PLAN,
     _tile_config,
     embedding_lookup,
@@ -200,6 +202,11 @@ def test_c12_tile_config_table():
     """_tile_config is correctness-critical (UB capacity) and host-only, so the
     documented table (design.md §4.2) is asserted directly, plus two invariants:
     every config fits UB_PLAN, and non-32B rows force single-row tiles."""
+    # Ascend 950: 248 KiB physical UB, 32 KiB reserved for the SimtVF thread
+    # context (src/ascend/transform/auto_schedule.cc GetSharedMemoryLimit).
+    assert UB_PHYSICAL == 248 * 1024
+    assert SIMT_VF_CONTEXT == 32 * 1024
+    assert UB_PLAN == 216 * 1024
     assert _tile_config(7168, 2) == (4, 3, 3)  # V4-Pro bf16
     assert _tile_config(4096, 2) == (8, 2, 2)  # V4-Flash bf16
     assert _tile_config(4080, 2) == (8, 2, 2)  # aligned odd H, 4-12 KiB class
@@ -207,7 +214,7 @@ def test_c12_tile_config_table():
     assert _tile_config(64, 2) == (8, 4, 4)
     assert _tile_config(4095, 2) == (1, 2, 2)  # non-32B rows: single-row tiles
     assert _tile_config(7168, 4) == (3, 2, 2)  # budget guard shrinks fp32 rows
-    assert _tile_config(4096, 4) == (4, 3, 3)  # exactly at the 192 KiB budget
+    assert _tile_config(4096, 4) == (4, 3, 3)  # 192 KiB, inside the 216 KiB budget
     for H in [1, 15, 64, 255, 256, 1024, 2048, 3584, 4080, 4095, 4096, 7168, 8192]:
         for esize in [2, 4]:
             tile_t, versions, num_stages = _tile_config(H, esize)
