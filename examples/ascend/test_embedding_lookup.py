@@ -154,7 +154,14 @@ def test_c9_compile_cache_reuse():
 
 @tilelang.testing.requires_ascend
 @pytest.mark.parametrize(
-    "H, nt", [(256, 64), (7168, 64), (7168, 66)]  # 64: block store at both H; 66: per-row tail guard
+    "H, nt",
+    [
+        (256, 64),   # unconditional-load class (small rows)
+        (4096, 64),  # conditional miss-load class, block store
+        (4096, 66),  # conditional miss-load class, per-row tail guard
+        (7168, 64),  # unconditional-load class, block store
+        (7168, 66),  # unconditional-load class, per-row tail guard
+    ],
 )
 def test_c10_repeat_compile_regression(H, nt, monkeypatch):
     """Gate against schedule variance (design.md §8.1 C10 / §9.1 S6): repeated
