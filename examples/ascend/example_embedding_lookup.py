@@ -31,6 +31,10 @@ UB_PHYSICAL = 248 * 1024
 SIMT_VF_CONTEXT = 32 * 1024
 UB_PLAN = UB_PHYSICAL - SIMT_VF_CONTEXT  # 216 KiB
 
+# Row-byte class boundaries shared by _tile_config and skip_miss_load.
+ROW_CLASS_MID = 4 * 1024
+ROW_CLASS_LARGE = 12 * 1024
+
 _DTYPE_STR = {
     torch.bfloat16: "bfloat16",
     torch.float16: "float16",
@@ -53,15 +57,22 @@ def _tile_config(H, esize):
     Non-32B row bytes force single-row tiles (S8).
     """
     row = H * esize
+    if row + 4 > UB_PLAN:
+        # Even one row plus ids_ub does not fit; fail early with a clear error
+        # instead of letting the Z3 scheduler report a negative capacity.
+        raise ValueError(
+            f"H={H} ({row} B/row) exceeds the usable UB budget "
+            f"({UB_PLAN} B, including ids_ub); row-dimension tiling is not supported"
+        )
     if row % 32 != 0:
         return 1, 2, 2
-    if row >= 12 * 1024:
+    if row >= ROW_CLASS_LARGE:
         tile_t, versions, num_stages = 4, 3, 3
-    elif row >= 4 * 1024:
+    elif row >= ROW_CLASS_MID:
         tile_t, versions, num_stages = 8, 2, 2
     else:
         tile_t, versions, num_stages = 8, 4, 4
-    if tile_t * row * versions > UB_PLAN:  # e.g. fp32 H=7168: keep (tile_t,2)
+    if tile_t * row * versions > UB_PLAN:  # e.g. fp32 H=7168: keep (3,2,2)
         tile_t = max(1, UB_PLAN // (2 * row))
         versions, num_stages = 2, 2
     if tile_t * row * versions > UB_PLAN:
@@ -70,8 +81,8 @@ def _tile_config(H, esize):
         # the load/store overlap for these shapes.
         versions, num_stages = 1, 1
     if tile_t * row * versions + tile_t * 4 > UB_PLAN:
-        # ids_ub also lives in UB; a single row that does not fit leaves no
-        # legal kernel. Row-dimension tiling is out of scope.
+        # Safety net for configurations that fit one row but not the chosen
+        # tile_t/versions; row-dimension tiling is out of scope.
         raise ValueError(
             f"H={H} ({row} B/row) exceeds the usable UB budget "
             f"({UB_PLAN} B, including ids_ub); row-dimension tiling is not supported"
@@ -101,7 +112,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
     # waste. Skipping it pays off only for 4-12 KiB rows, where the fill/store
     # pipeline can still overlap (-39% at H=4096 TP=8, neutral at TP=1). For
     # >=12 KiB rows it regresses TP=1 by ~20% and gains ~3% at TP=8.
-    skip_miss_load = 4 * 1024 <= H * esize < 12 * 1024
+    skip_miss_load = ROW_CLASS_MID <= H * esize < ROW_CLASS_LARGE
     block_store = num_tokens % tile_t == 0  # no tail tile: block MTE3 is safe
     num_tiles = (num_tokens + tile_t - 1) // tile_t
     num_cores = min(get_num_vector_cores(), num_tiles)
@@ -141,7 +152,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                                     row_ub[i, j] = T.cast(0, dtype)
                     # one block store for the whole tile (tile_t*H contiguous)
                     T.copy(row_ub, Out[t0 : t0 + tile_t, :])
-                else:
+                else:  # block_store is False here; the tail guard below is live
                     for i in T.Pipelined(tile_t, num_stages=num_stages):
                         tk = t0 + i
                         if tk < num_tokens:  # tail-tile guard
@@ -175,6 +186,7 @@ def embedding_lookup(
     weight: torch.Tensor,
     vocab_start_index: int = 0,
     vocab_end_index: int | None = None,
+    sync: bool = True,
 ) -> torch.Tensor:
     """Gather rows of ``weight`` for ids in ``[vocab_start_index, vocab_end_index)``;
     ids outside the range produce zero rows. Returns ``(*input_ids.shape, H)``.
@@ -182,6 +194,9 @@ def embedding_lookup(
     Caller contract (design.md §3.2): ids in ``[0, vocab_size)`` (int64 inputs
     are converted to int32 losslessly for vocab < 2^31), ``weight`` row-major
     contiguous on NPU with ``weight.shape[0] == vocab_end - vocab_start``.
+
+    ``sync`` defaults to True so tests/profiles see a completed tensor; set
+    ``sync=False`` to keep the call asynchronous when chaining ops.
     """
     orig_shape = tuple(input_ids.shape)
     shard_rows, H = weight.shape
@@ -202,24 +217,35 @@ def embedding_lookup(
         return torch.empty(orig_shape + (H,), device=weight.device, dtype=weight.dtype)
     kernel = embedding_lookup_fwd(ids.numel(), shard_rows, H, dtype)
     out = kernel(ids, weight, vocab_start_index, vocab_end_index)
-    torch.npu.synchronize()
+    if sync:
+        torch.npu.synchronize()
     return out.reshape(orig_shape + (H,))
 
 
-def run_regression_perf(num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=129280):
-    """Full-table (TP=1) bandwidth regression (design.md §6.1/§8.2)."""
+def run_regression_perf(
+    num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=129280, id_vocab_size=None
+):
+    """Bandwidth regression (design.md §6.1/§8.2).
+
+    ``vocab_size`` is the local weight rows (TP shard); ``id_vocab_size`` is the
+    global id range. Leaving it None means TP=1 (all ids hit). Passing
+    ``vocab_size=16160, id_vocab_size=129280`` simulates TP=8 (12.5% hit).
+    """
+    id_vocab_size = vocab_size if id_vocab_size is None else id_vocab_size
     kernel = embedding_lookup_fwd(num_tokens, vocab_size, H, dtype)
-    ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int32).npu()
+    ids = torch.randint(0, id_vocab_size, (num_tokens,), dtype=torch.int32).npu()
     w = torch.randn(vocab_size, H, device="npu").to(_STR_TO_TORCH[dtype])
     latency = do_bench(
         lambda: kernel(ids, w, 0, vocab_size), backend="msprof", _n_warmup=30, _n_repeat=50
     )
-    # TP=1 full table: every id hits -- one row read + one row written per
-    # token; the 4 B/token id traffic is negligible but counted.
-    num_bytes = (2 * num_tokens * H + num_tokens) * w.element_size()
+    # Read = hit rows only (miss reads are clamped/L2 or skipped); write = all
+    # rows; ids are int32 (4 B/token), independent of the weight dtype.
+    hit_ratio = ((ids >= 0) & (ids < vocab_size)).float().mean().item()
+    num_bytes = (hit_ratio * num_tokens * H + num_tokens * H) * w.element_size() + num_tokens * 4
     bandwidth = num_bytes / (latency * 1e6)
     print(
-        f"embedding_lookup (num_tokens={num_tokens}, H={H}, {dtype}): "
+        f"embedding_lookup (num_tokens={num_tokens}, H={H}, rows={vocab_size}, "
+        f"id_range={id_vocab_size}, hit={hit_ratio:.3f}, {dtype}): "
         f"{latency * 1000:.2f} us | {bandwidth:.2f} GB/s"
     )
     return latency
@@ -239,4 +265,9 @@ if __name__ == "__main__":
     assert torch.equal(out, ref_program(ids, w, vocab_start, vocab_end)), "output mismatch"
     print("embedding_lookup: correctness passed")
     if args.bench:
+        # TP=1 production shapes (H=4096 also exercises the conditional-load code path).
+        run_regression_perf(H=4096)
         run_regression_perf()
+        # TP=8 simulation: local shard 16160, global ids 129280 -> 12.5% hit,
+        # exercising the miss-read skip on the 4-12 KiB row class.
+        run_regression_perf(H=4096, vocab_size=16160, id_vocab_size=129280)

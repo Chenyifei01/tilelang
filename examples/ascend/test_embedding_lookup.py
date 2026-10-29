@@ -282,6 +282,7 @@ def test_c14_row_class_boundaries(H):
         (torch.float32, 4096),
         (torch.float32, 7168),  # budget guard -> (3,2,2), per-row for nt=64
         (torch.float32, 8192),
+        (torch.float32, 32768),  # 128 KiB row -> (1,1,1) single-buffer fallback
     ],
 )
 def test_c15_dtype_large_H(dtype, H):
