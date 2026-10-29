@@ -22,9 +22,9 @@ import tilelang.ascend.language as T
 from tilelang.carver.arch.driver import get_num_vector_cores
 from tilelang.profiler import do_bench
 
-# Ascend 950 physical UB is 248 KiB (src/ascend/transform/auto_schedule.cc,
-# kPhysicalUnifiedBufferSize). A kernel containing T.SimtVF loses 32 KiB to the
-# VF thread context (kSimtVFThreadContextSize), so the scheduler's shared-memory
+# Ascend 950 physical UB is 248 KiB (src/ascend/target_utils.h,
+# kAscendUBMemoryBytes). A kernel containing T.SimtVF loses 32 KiB to the VF
+# thread context (kAscendSimtContextBytes), so the scheduler's shared-memory
 # limit here is 216 KiB; plan at that limit. (Measured boundary: (4,3)@H=7168 =
 # 168 KiB compiles, (4,4) = 224 KiB fails with capacity -8192 B.)
 UB_PHYSICAL = 248 * 1024

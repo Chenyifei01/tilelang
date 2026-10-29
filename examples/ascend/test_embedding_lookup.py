@@ -214,7 +214,7 @@ def test_c12_tile_config_table():
     documented table (design.md §4.2) is asserted directly, plus two invariants:
     every config fits UB_PLAN, and non-32B rows force single-row tiles."""
     # Ascend 950: 248 KiB physical UB, 32 KiB reserved for the SimtVF thread
-    # context (src/ascend/transform/auto_schedule.cc GetSharedMemoryLimit).
+    # context (src/ascend/target_utils.h; consumed by GetSharedMemoryLimit).
     assert UB_PHYSICAL == 248 * 1024
     assert SIMT_VF_CONTEXT == 32 * 1024
     assert UB_PLAN == 216 * 1024
