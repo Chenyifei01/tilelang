@@ -47,7 +47,9 @@ def _tile_config(H, esize):
     stream-copy baseline); small rows keep a deeper pipeline (tt8/v4). The
     budget guard shrinks tile_t rather than lose double buffering (fp32 rows);
     the budget is the scheduler's 216 KiB (248 KiB physical minus the 32 KiB
-    SimtVF thread context), not the raw physical size.
+    SimtVF thread context), not the raw physical size. Rows larger than
+    UB_PLAN/2 fall back to a single buffer (versions=1); a row that still does
+    not fit (including ids_ub) raises ValueError (no row-dimension tiling).
     Non-32B row bytes force single-row tiles (S8).
     """
     row = H * esize
@@ -62,6 +64,18 @@ def _tile_config(H, esize):
     if tile_t * row * versions > UB_PLAN:  # e.g. fp32 H=7168: keep (tile_t,2)
         tile_t = max(1, UB_PLAN // (2 * row))
         versions, num_stages = 2, 2
+    if tile_t * row * versions > UB_PLAN:
+        # Very large rows (row > UB_PLAN/2): double buffering cannot fit, fall
+        # back to a single buffer. Correctness is unchanged; the pipeline loses
+        # the load/store overlap for these shapes.
+        versions, num_stages = 1, 1
+    if tile_t * row * versions + tile_t * 4 > UB_PLAN:
+        # ids_ub also lives in UB; a single row that does not fit leaves no
+        # legal kernel. Row-dimension tiling is out of scope.
+        raise ValueError(
+            f"H={H} ({row} B/row) exceeds the usable UB budget "
+            f"({UB_PLAN} B, including ids_ub); row-dimension tiling is not supported"
+        )
     return tile_t, versions, num_stages
 
 
