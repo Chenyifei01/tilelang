@@ -1,10 +1,12 @@
 """Correctness tests for the vocab-parallel embedding lookup example.
 
-Cases map to ``embedding_lookup/design.md`` §8.1 (C1-C20). Comparisons are
+Cases map to ``embedding_lookup/design.md`` §8.1 (C1-C25). Comparisons are
 bit-exact via ``torch.equal`` unless noted (design.md §5: gather is pure
-address movement, no rounding). C14-C20 are the generalization matrix:
-row-class boundaries, large H / single-buffer fallback, dtype x H, input
-forms, TP shard sums, id patterns, wave boundaries, and config invariants.
+address movement, no rounding). C14-C20 are the generalization matrix
+(row-class boundaries, large H / single-buffer fallback, dtype x H, input
+forms, TP shard sums, id patterns, wave boundaries, config invariants);
+C21-C25 add the broad shape/dtype sweeps (20 H values, 12 nt values,
+3 dtypes x 4 input forms, TP=8 x 4 H, fp16/fp32 x 4 H) for 100 cases total.
 """
 
 import hashlib
@@ -426,3 +428,93 @@ def test_c20_tile_config_boundaries():
             assert tile_t * row * versions + tile_t * 4 <= UB_PLAN, (H, esize)
             if row % 32 != 0:
                 assert tile_t == 1, (H, esize)
+
+
+# --------------------------------------------------------------------------
+# Broad shape / dtype sweeps (C21-C25): ~52 more cases
+# --------------------------------------------------------------------------
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize(
+    "H",
+    [1, 2, 3, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 257, 1023, 4097],
+)
+def test_c21_H_sweep(H):
+    """H sweep across 32B-aligned/unaligned and small/large rows (bf16)."""
+    nt, vocab, start, end = 64, 32, 8, 24
+    ids = _rand_ids(nt, vocab, seed=61)
+    w = _rand_weight(end - start, H, seed=62)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.shape == (nt, H)
+    assert torch.equal(out, ref_program(ids, w, start, end))
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("nt", [1, 2, 3, 7, 8, 9, 15, 16, 17, 55, 56, 57])
+def test_c22_nt_sweep(nt):
+    """num_tokens sweep around tile_t=8 and the tail/block boundary."""
+    vocab, start, end, H = 64, 8, 56, 64
+    ids = _rand_ids(nt, vocab, seed=63)
+    w = _rand_weight(end - start, H, seed=64)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.shape == (nt, H)
+    assert torch.equal(out, ref_program(ids, w, start, end))
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("form", ["1d_int32", "1d_int64", "2d", "3d"])
+def test_c23_input_dtype_forms(dtype, form):
+    """dtype x id dtype x input rank matrix."""
+    nt, vocab, start, end, H = 64, 32, 8, 24, 128
+    base = _rand_ids(nt, vocab, seed=65)
+    if form == "1d_int32":
+        ids = base
+    elif form == "1d_int64":
+        ids = base.to(torch.int64)
+    elif form == "2d":
+        ids = base.reshape(8, 8)
+    else:
+        ids = base.reshape(4, 4, 4)
+    w = _rand_weight(end - start, H, dtype, seed=66)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.shape == tuple(ids.shape) + (H,)
+    assert out.dtype == dtype
+    expect = ref_program(ids.reshape(-1), w, start, end).reshape(tuple(ids.shape) + (H,))
+    assert torch.equal(out, expect)
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("H", [64, 128, 256, 512])
+def test_c24_tp8_H_sweep(H):
+    """TP=8 reconstruction across H values."""
+    vocab, shard, nt = 1024, 128, 256
+    torch.manual_seed(67)
+    full_w = torch.randn(vocab, H, device="npu").to(torch.bfloat16)
+    ids = torch.randint(0, vocab, (nt,), dtype=torch.int32).npu()
+    total = torch.zeros(nt, H, device="npu").to(torch.bfloat16)
+    for rank in range(8):
+        s = rank * shard
+        total += embedding_lookup(ids, full_w[s : s + shard], s, s + shard)
+    torch.testing.assert_close(total, torch.nn.functional.embedding(ids, full_w), rtol=1e-5, atol=1e-5)
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize(
+    "dtype, H",
+    [
+        (torch.float16, 2048),
+        (torch.float16, 4096),
+        (torch.float32, 2048),
+        (torch.float32, 4096),
+    ],
+)
+def test_c25_dtype_H_sweep(dtype, H):
+    """fp16/fp32 across the 4 KiB and 8/16 KiB row classes."""
+    nt, vocab, start, end = 64, 32, 8, 24
+    ids = _rand_ids(nt, vocab, seed=68)
+    w = _rand_weight(end - start, H, dtype, seed=69)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.dtype == dtype
+    assert torch.equal(out, ref_program(ids, w, start, end))
