@@ -186,7 +186,6 @@ def embedding_lookup(
     weight: torch.Tensor,
     vocab_start_index: int = 0,
     vocab_end_index: int | None = None,
-    sync: bool = True,
 ) -> torch.Tensor:
     """Gather rows of ``weight`` for ids in ``[vocab_start_index, vocab_end_index)``;
     ids outside the range produce zero rows. Returns ``(*input_ids.shape, H)``.
@@ -195,8 +194,10 @@ def embedding_lookup(
     are converted to int32 losslessly for vocab < 2^31), ``weight`` row-major
     contiguous on NPU with ``weight.shape[0] == vocab_end - vocab_start``.
 
-    ``sync`` defaults to True so tests/profiles see a completed tensor; set
-    ``sync=False`` to keep the call asynchronous when chaining ops.
+    The kernel works on a flat token axis: for contiguous ids ``reshape(-1)``
+    is a zero-copy view; a non-contiguous input incurs one int32 copy
+    (4 B/token). The wrapper does not synchronize, matching the other Ascend
+    examples; callers own any required stream synchronization.
     """
     orig_shape = tuple(input_ids.shape)
     shard_rows, H = weight.shape
@@ -210,6 +211,8 @@ def embedding_lookup(
     dtype = _DTYPE_STR.get(weight.dtype)
     if dtype is None:
         raise TypeError(f"unsupported weight dtype: {weight.dtype}")
+    # The kernel indexes a flat token axis. For contiguous [B,S] ids this is a
+    # zero-copy view; a non-contiguous input triggers one int32 copy (4 B/token).
     ids = input_ids.reshape(-1)
     if ids.dtype != torch.int32:
         ids = ids.to(torch.int32)
@@ -217,8 +220,6 @@ def embedding_lookup(
         return torch.empty(orig_shape + (H,), device=weight.device, dtype=weight.dtype)
     kernel = embedding_lookup_fwd(ids.numel(), shard_rows, H, dtype)
     out = kernel(ids, weight, vocab_start_index, vocab_end_index)
-    if sync:
-        torch.npu.synchronize()
     return out.reshape(orig_shape + (H,))
 
 
