@@ -52,7 +52,7 @@ NUM_AIV = 56
 UB_PLAN = 192 * 1024
 # Tokens one core scans (and may compact) in the fused kernel; the lists live
 # in UB, so this also bounds the tokens one call may process.
-PREP_BLK = 2048
+PREP_BLK = 1536
 MAX_TOKENS = NUM_AIV * PREP_BLK
 
 _DTYPE_STR = {
@@ -110,77 +110,65 @@ def _pipeline_config(H, esize_src, esize_acc, list_bytes=0):
     return versions, versions
 
 
-def _list_bytes(id_dtype):
-    """UB held by the per-core id copy plus the ``(row, id)`` compacted lists."""
-    esize_id = 8 if id_dtype == "int64" else 4
-    return PREP_BLK * (esize_id + 4 + 4)
+def _list_bytes(id_dtype, split_unique):
+    """UB held by the per-core id copy plus the compacted ``(row, id)`` lists.
 
-
-def embedding_grad_reduce_fused_fwd(
-    num_rows, H, in_dtype="bfloat16", acc_dtype="float32", scale_by_freq=False, id_dtype="int32"
-):
-    """Build the single fused kernel: filter, compact, accumulate.
-
-    Each core scans its token slice, keeps the ids that belong to this rank's
-    vocab shard (and are not ``padding_idx``), compacts them into two UB lists
-    -- the ``GradOut`` row and the destination row -- and then runs the
-    multi-buffered row pipeline over exactly those hits. The pipeline bound is
-    the core's own hit count, so there is no tail clamp and no conditional MTE;
-    the only data-dependent control flow is the scalar filter pass.
+    Split mode stages every hit in ``all_*``, gathers the per-row counts into
+    ``uniq`` and then partitions into the plain/atomic lists; the atomic-only
+    mode writes straight into its two lists.
     """
+    esize_id = 8 if id_dtype == "int64" else 4
+    lists = 7 if split_unique else 2  # all(2) + uniq(1) + plain(2) + atom(2)
+    return PREP_BLK * (esize_id + 4 * lists)
+
+
+@tilelang.jit(target="ascend")
+def embedding_grad_reduce_kernel(
+    num_rows,
+    H,
+    in_dtype="bfloat16",
+    acc_dtype="float32",
+    scale_grad_by_freq=False,
+    id_dtype="int32",
+    split_unique=False,
+):
+    """Build and JIT-cache the scatter-add kernel.
+
+    Compile-time: ``num_rows``/``H``/the dtypes/``scale_grad_by_freq``/
+    ``split_unique``. Runtime (dynamic): the token count ``n`` and the table
+    row count, so one binary serves every step.
+
+    The kernel takes the caller's ids plus a per-row occurrence histogram
+    (``Counts``), produced by its own two tiny launches. Each core compacts its
+    own hits into two UB lists and then runs two pipelined passes:
+
+    * rows whose id occurs exactly once go to the plain-store list -- a single
+      writer means a normal store is enough, so only ``read + write``
+      (6 B/elem) moves instead of an atomic read-modify-write (10 B/elem);
+    * rows that occur more than once go to the atomic-add list.
+
+    The split is per row, not per token: every writer of a row takes the same
+    branch, so the two lists never touch the same row and no ordering is
+    required between them. ``split_unique=False`` sends everything to the
+    atomic list, which is what a caller accumulating into a non-zero table
+    (``out`` reused across calls) must use. ``scale_grad_by_freq`` divides
+    every contribution by its id count.
+
+    Duplicate ids accumulate through the hardware store-mode atomic add; the
+    order across cores and tokens is not fixed (see the module docstring).
+    """
+    assert num_rows > 0 and H > 0
     esize_src = 2 if in_dtype in ("bfloat16", "float16") else 4
     esize_acc = 2 if acc_dtype in ("bfloat16", "float16") else 4
-    versions, num_stages = _pipeline_config(H, esize_src, esize_acc, _list_bytes(id_dtype))
     vf_threads = _vf_threads(H)
+    versions, num_stages = _pipeline_config(H, esize_src, esize_acc, _list_bytes(id_dtype, split_unique))
     n = T.dynamic("n")
     rows = T.dynamic("rows")
-
-    if scale_by_freq:
-
-        @T.prim_func
-        def fused(
-            Ids: T.Tensor((n,), id_dtype),
-            Counts: T.Tensor((rows,), "int32"),
-            GradOut: T.Tensor((n, H), in_dtype),
-            GradWeight: T.Tensor((num_rows, H), acc_dtype),
-            vocab_start: T.int32,
-            vocab_end: T.int32,
-            padding_idx: T.int32,
-        ):
-            with T.Kernel(NUM_AIV) as core:
-                id_ub = T.alloc_shared((PREP_BLK,), id_dtype)
-                src_list = T.alloc_shared((PREP_BLK,), "int32")
-                dst_list = T.alloc_shared((PREP_BLK,), "int32")
-                src_ub = T.alloc_shared((H,), in_dtype)
-                acc_ub = T.alloc_shared((H,), acc_dtype)
-                T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
-                pos = T.alloc_var("int32", init=0)
-                chunk = (n + NUM_AIV - 1) // NUM_AIV
-                base = core * chunk
-                T.copy(Ids[base : base + PREP_BLK], id_ub)
-                for j in T.serial(T.min(chunk, PREP_BLK)):
-                    t = base + j
-                    idv = T.cast(id_ub[j], "int32")
-                    if (t < n) and (idv >= vocab_start) and (idv < vocab_end) and (idv != padding_idx):
-                        src_list[pos] = t
-                        dst_list[pos] = idv - vocab_start
-                        pos += 1
-                T.set_atomic("add", acc_dtype)
-                for i in T.Pipelined(pos, num_stages=num_stages):
-                    row = dst_list[i]
-                    scale = T.cast(1, "float32") / T.cast(Counts[row], "float32")
-                    T.copy(GradOut[src_list[i], :], src_ub)
-                    with T.SimtVF(threads=vf_threads):
-                        for j in T.Parallel(H):
-                            acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
-                    T.copy(acc_ub, GradWeight[row, :])
-                T.set_atomic_none()
-
-        return fused
 
     @T.prim_func
     def fused(
         Ids: T.Tensor((n,), id_dtype),
+        Counts: T.Tensor((rows,), "int32"),
         GradOut: T.Tensor((n, H), in_dtype),
         GradWeight: T.Tensor((num_rows, H), acc_dtype),
         vocab_start: T.int32,
@@ -189,40 +177,93 @@ def embedding_grad_reduce_fused_fwd(
     ):
         with T.Kernel(NUM_AIV) as core:
             id_ub = T.alloc_shared((PREP_BLK,), id_dtype)
-            src_list = T.alloc_shared((PREP_BLK,), "int32")
-            dst_list = T.alloc_shared((PREP_BLK,), "int32")
+            all_src = T.alloc_shared((PREP_BLK,), "int32")
+            all_dst = T.alloc_shared((PREP_BLK,), "int32")
+            uniq = T.alloc_shared((PREP_BLK,), "int32")
+            plain_src = T.alloc_shared((PREP_BLK,), "int32")
+            plain_dst = T.alloc_shared((PREP_BLK,), "int32")
+            atom_src = T.alloc_shared((PREP_BLK,), "int32")
+            atom_dst = T.alloc_shared((PREP_BLK,), "int32")
             src_ub = T.alloc_shared((H,), in_dtype)
             acc_ub = T.alloc_shared((H,), acc_dtype)
             T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
-            pos = T.alloc_var("int32", init=0)
+            n_all = T.alloc_var("int32", init=0)
+            n_plain = T.alloc_var("int32", init=0)
+            n_atom = T.alloc_var("int32", init=0)
             chunk = (n + NUM_AIV - 1) // NUM_AIV
             base = core * chunk
             T.copy(Ids[base : base + PREP_BLK], id_ub)
+            # Scalar filter + compact. Every pipeline below runs exactly its own
+            # count, so no MTE is ever conditionally dispatched.
             for j in T.serial(T.min(chunk, PREP_BLK)):
                 t = base + j
                 idv = T.cast(id_ub[j], "int32")
                 if (t < n) and (idv >= vocab_start) and (idv < vocab_end) and (idv != padding_idx):
-                    src_list[pos] = t
-                    dst_list[pos] = idv - vocab_start
-                    pos += 1
-            T.set_atomic("add", acc_dtype)
-            for i in T.Pipelined(pos, num_stages=num_stages):
-                T.copy(GradOut[src_list[i], :], src_ub)
+                    all_src[n_all] = t
+                    all_dst[n_all] = idv - vocab_start
+                    n_all += 1
+            if split_unique:
+                # The per-row counts are scattered in GM; gather them in the VF
+                # so the latencies overlap instead of serializing the scalar
+                # loop above.
+                with T.SimtVF(threads=256):
+                    for j in T.Parallel(PREP_BLK):
+                        uniq[j] = Counts[T.if_then_else(j < n_all, all_dst[j], 0)]
+                # Partition in UB only.
+                for j in T.serial(n_all):
+                    if uniq[j] == 1:
+                        plain_src[n_plain] = all_src[j]
+                        plain_dst[n_plain] = all_dst[j]
+                        n_plain += 1
+                    else:
+                        atom_src[n_atom] = all_src[j]
+                        atom_dst[n_atom] = all_dst[j]
+                        n_atom += 1
+            else:
+                n_atom = n_all
+                for j in T.serial(n_all):
+                    atom_src[j] = all_src[j]
+                    atom_dst[j] = all_dst[j]
+            # Single-writer rows: a plain store is correct and moves 4 B/elem
+            # instead of the atomic read-modify-write's 8 B/elem.
+            for i in T.Pipelined(n_plain, num_stages=num_stages):
+                row = plain_dst[i]
+                T.copy(GradOut[plain_src[i], :], src_ub)
                 with T.SimtVF(threads=vf_threads):
                     for j in T.Parallel(H):
-                        acc_ub[j] = T.cast(src_ub[j], acc_dtype)
-                T.copy(acc_ub, GradWeight[dst_list[i], :])
+                        if scale_grad_by_freq:
+                            acc_ub[j] = T.cast(src_ub[j], acc_dtype) * (
+                                T.cast(1, "float32") / T.cast(Counts[row], "float32")
+                            )
+                        else:
+                            acc_ub[j] = T.cast(src_ub[j], acc_dtype)
+                T.copy(acc_ub, GradWeight[row, :])
+            # Shared rows: hardware store-mode atomic add.
+            T.set_atomic("add", acc_dtype)
+            for i in T.Pipelined(n_atom, num_stages=num_stages):
+                row = atom_dst[i]
+                T.copy(GradOut[atom_src[i], :], src_ub)
+                with T.SimtVF(threads=vf_threads):
+                    for j in T.Parallel(H):
+                        if scale_grad_by_freq:
+                            acc_ub[j] = T.cast(src_ub[j], acc_dtype) * (
+                                T.cast(1, "float32") / T.cast(Counts[row], "float32")
+                            )
+                        else:
+                            acc_ub[j] = T.cast(src_ub[j], acc_dtype)
+                T.copy(acc_ub, GradWeight[row, :])
             T.set_atomic_none()
 
     return fused
 
 
-def embedding_grad_reduce_hist_fwd(id_dtype="int32"):
+@tilelang.jit(target="ascend")
+def embedding_grad_reduce_hist_kernel(id_dtype="int32"):
     """Per-row occurrence histogram, used only by ``scale_grad_by_freq``.
 
     Counts must be complete before any ``1/count`` is applied, so this runs as
-    its own launch ahead of the fused kernel (the stacked rows make that
-    unavoidable inside one kernel without a grid barrier).
+    its own launch ahead of the fused kernel (rows touched by several cores
+    make it impossible inside one kernel without a grid barrier).
     """
     n = T.dynamic("n")
     rows = T.dynamic("rows")
@@ -249,8 +290,9 @@ def embedding_grad_reduce_hist_fwd(id_dtype="int32"):
     return histogram
 
 
-def embedding_grad_reduce_zero_fwd():
-    """Build the histogram-zeroing kernel (one launch before ``histogram``)."""
+@tilelang.jit(target="ascend")
+def embedding_grad_reduce_zero_kernel():
+    """Zero the histogram (one launch before ``hist``)."""
     rows = T.dynamic("rows")
 
     @T.prim_func
@@ -262,62 +304,6 @@ def embedding_grad_reduce_zero_fwd():
                     Counts[T.min(core * chunk + j, rows - 1)] = 0
 
     return zero
-
-
-def embedding_grad_reduce_whole_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype="float32", id_dtype="int32"):
-    """Build the whole-table kernel: every token is a hit, ids read in place."""
-    esize_src = 2 if in_dtype in ("bfloat16", "float16") else 4
-    esize_acc = 2 if acc_dtype in ("bfloat16", "float16") else 4
-    versions, num_stages = _pipeline_config(H, esize_src, esize_acc)
-    vf_threads = _vf_threads(H)
-    n = T.dynamic("n")
-
-    @T.prim_func
-    def whole(
-        Ids: T.Tensor((n,), id_dtype),
-        GradOut: T.Tensor((n, H), in_dtype),
-        GradWeight: T.Tensor((num_rows, H), acc_dtype),
-    ):
-        with T.Kernel(NUM_AIV) as core:
-            src_ub = T.alloc_shared((H,), in_dtype)
-            acc_ub = T.alloc_shared((H,), acc_dtype)
-            T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
-            chunk = (n + NUM_AIV - 1) // NUM_AIV
-            T.set_atomic("add", acc_dtype)
-            for i in T.Pipelined(chunk, num_stages=num_stages):
-                t = core * chunk + i
-                tt = T.min(t, n - 1)
-                # Clamped tail rows read a real row and add zero to a real row:
-                # no conditional DMA or atomic store.
-                g_scale = T.if_then_else(t < n, T.cast(1, "float32"), T.cast(0, "float32"))
-                T.copy(GradOut[tt, :], src_ub)
-                with T.SimtVF(threads=vf_threads):
-                    for j in T.Parallel(H):
-                        acc_ub[j] = T.cast(src_ub[j], acc_dtype) * g_scale
-                T.copy(acc_ub, GradWeight[Ids[tt], :])
-            T.set_atomic_none()
-
-    return whole
-
-
-@tilelang.jit(target="ascend")
-def _fused_kernel(num_rows, H, in_dtype, acc_dtype, scale_by_freq, id_dtype):
-    return embedding_grad_reduce_fused_fwd(num_rows, H, in_dtype, acc_dtype, scale_by_freq, id_dtype)
-
-
-@tilelang.jit(target="ascend")
-def _hist_kernel(id_dtype):
-    return embedding_grad_reduce_hist_fwd(id_dtype)
-
-
-@tilelang.jit(target="ascend")
-def _zero_kernel():
-    return embedding_grad_reduce_zero_fwd()
-
-
-@tilelang.jit(target="ascend")
-def _whole_kernel(num_rows, H, in_dtype, acc_dtype, id_dtype):
-    return embedding_grad_reduce_whole_fwd(num_rows, H, in_dtype, acc_dtype, id_dtype)
 
 
 def ref_program(grad_output, indices, num_weights, padding_idx=-1, scale_grad_by_freq=False,
@@ -356,18 +342,26 @@ def embedding_grad_reduce(
     vocab_start_index: int = 0,
     vocab_end_index: int | None = None,
     out: torch.Tensor | None = None,
+    out_zeroed: bool = False,
 ) -> torch.Tensor:
     """Accumulate ``grad_output`` into ``grad_weight[indices]`` (fp32 table).
 
     ``num_weights`` is the number of rows this rank owns; with
     ``vocab_end_index`` set it defaults to ``vocab_end_index - vocab_start_index``.
     Ids outside ``[vocab_start_index, vocab_end_index)`` and ``padding_idx``
-    are dropped by the ``prepare`` kernel (not by the host).
+    are dropped inside the kernel (not by the host).
 
-    ``out`` may be an existing fp32 ``[num_weights, H]`` table to accumulate
-    into (the training-framework path, e.g. MTP reusing the same embedding);
-    when omitted a zero table is allocated and returned. Returned dtype is
-    fp32 (internal accumulation precision), not ``grad_output``'s dtype.
+    ``out`` may be an existing fp32 ``[num_weights, H]`` table. When the table
+    is known to hold zeros -- a freshly allocated one, which is what autograd
+    hands a backward -- pass ``out_zeroed=True`` (or omit ``out`` and let the
+    wrapper allocate it): the kernel then writes single-contribution rows with
+    plain stores, moving 6 B/elem instead of the 10 B/elem an atomic
+    read-modify-write needs. For a table that already holds values (e.g. MTP
+    accumulating several branches into one embedding), leave ``out_zeroed``
+    false and every row goes through the atomic add.
+
+    Returned dtype is fp32 (internal accumulation precision), not
+    ``grad_output``'s dtype.
 
     Caller contract: ``indices`` holds ids in ``[0, vocab_size)`` for the
     *full* table; ids may repeat. ``grad_output`` must be row-major contiguous.
@@ -393,6 +387,7 @@ def embedding_grad_reduce(
 
     if out is None:
         out = torch.zeros(num_weights, H, dtype=torch.float32, device=grad_output.device)
+        out_zeroed = True
     else:
         assert out.dtype == torch.float32, "out must be fp32 (internal accumulation dtype)"
         assert out.shape == (num_weights, H), f"out must be {(num_weights, H)}, got {tuple(out.shape)}"
@@ -407,52 +402,42 @@ def embedding_grad_reduce(
     if n == 0:  # nothing to scatter
         return out
 
-    device = go.device
-    whole_table = (
-        vocab_start_index == 0
-        and vocab_end_index == num_weights
-        and padding_idx < 0
-        and not scale_grad_by_freq
-    )
-    if whole_table:
-        kernel = _whole_kernel(num_weights, H, in_dtype, "float32", id_dtype)
-        kernel(idx, go, out)
-        return out
-
     assert n <= MAX_TOKENS, (
         f"one core scans at most {PREP_BLK} tokens, so this build handles "
         f"{MAX_TOKENS} tokens per call; got {n}"
     )
-    if scale_grad_by_freq:
-        # Counts span cores, so the histogram (and its zeroing) has to finish
-        # before the fused kernel can divide by it.
-        counts = _counts(num_weights, device)
-        _zero_kernel()(counts)
-        _hist_kernel(id_dtype)(idx, counts, vocab_start_index, vocab_end_index, padding_idx)
-        _fused_kernel(num_weights, H, in_dtype, "float32", True, id_dtype)(
-            idx, counts, go, out, vocab_start_index, vocab_end_index, padding_idx
-        )
-    else:
-        _fused_kernel(num_weights, H, in_dtype, "float32", False, id_dtype)(
-            idx, go, out, vocab_start_index, vocab_end_index, padding_idx
-        )
+    device = go.device
+    # Counts span cores, so the histogram (and its zeroing) has to finish before
+    # the fused kernel can split unique rows or divide by 1/count.
+    counts = _counts(num_weights, device)
+    embedding_grad_reduce_zero_kernel()(counts)
+    embedding_grad_reduce_hist_kernel(id_dtype)(idx, counts, vocab_start_index, vocab_end_index, padding_idx)
+    embedding_grad_reduce_kernel(
+        num_weights, H, in_dtype, "float32", scale_grad_by_freq, id_dtype, out_zeroed
+    )(idx, counts, go, out, vocab_start_index, vocab_end_index, padding_idx)
     return out
 
 
+def _traffic_bytes(ids, hits, H, esize_src, esize_acc):
+    """Bytes actually moved: one grad-row read per hit, one plain write per
+    single-contribution row, one atomic read-modify-write per duplicate token."""
+    uniq = int(torch.unique(ids, return_counts=False).numel()) if hits else 0
+    dups = hits - uniq
+    return hits * H * esize_src + uniq * H * esize_acc + dups * H * 2 * esize_acc
+
+
 def run_regression_perf(num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=129280):
-    """Full-table bandwidth regression (read each grad row + atomic add it)."""
+    """Full-table bandwidth regression (read each grad row, write each row once)."""
     ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int32).npu()
     go = torch.randn(num_tokens, H, device="npu").to(_STR_TO_TORCH[dtype])
     gw = torch.zeros(vocab_size, H, dtype=torch.float32, device="npu")
     latency = do_bench(
-        lambda: embedding_grad_reduce(go, ids, vocab_size, out=gw),
+        lambda: embedding_grad_reduce(go, ids, vocab_size, out=gw, out_zeroed=True),
         backend="msprof",
         _n_warmup=30,
         _n_repeat=50,
     )
-    # Logical traffic: one grad-row read plus one atomic read-modify-write of
-    # the destination row per token; ids/src/inv are negligible.
-    num_bytes = num_tokens * H * (go.element_size() + 2 * gw.element_size())
+    num_bytes = _traffic_bytes(ids.cpu(), num_tokens, H, go.element_size(), gw.element_size())
     bandwidth = num_bytes / (latency * 1e6)
     print(
         f"embedding_grad_reduce (num_tokens={num_tokens}, H={H}, {dtype}): "
@@ -469,13 +454,16 @@ def run_sharded_perf(num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=1292
     gw = torch.zeros(shard, H, dtype=torch.float32, device="npu")
     start, end = 3 * shard, 4 * shard  # arbitrary rank 3 of 8
     latency = do_bench(
-        lambda: embedding_grad_reduce(go, ids, vocab_end_index=end, vocab_start_index=start, out=gw),
+        lambda: embedding_grad_reduce(
+            go, ids, vocab_end_index=end, vocab_start_index=start, out=gw, out_zeroed=True
+        ),
         backend="msprof",
         _n_warmup=10,
         _n_repeat=30,
     )
-    hits = int(((ids >= start) & (ids < end)).sum().item())
-    num_bytes = hits * H * (go.element_size() + 2 * gw.element_size())
+    hit_ids = ids[(ids >= start) & (ids < end)]
+    hits = int(hit_ids.numel())
+    num_bytes = _traffic_bytes(hit_ids.cpu(), hits, H, go.element_size(), gw.element_size())
     bandwidth = num_bytes / (latency * 1e6)
     print(
         f"embedding_grad_reduce shard (TP={tp}, hits={hits}/{num_tokens}, H={H}, {dtype}): "
