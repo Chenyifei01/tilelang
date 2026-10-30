@@ -188,8 +188,8 @@ def test_c11_no_hits_and_empty():
 def test_c12_dynamic_token_count_reuses_binary():
     """The token count is dynamic: one kernel object serves every hit count."""
     vocab, H = 16, 64
-    k1 = embedding_grad_reduce_kernel(vocab, H, "bfloat16", "float32", False, "int32", True)
-    k2 = embedding_grad_reduce_kernel(vocab, H, "bfloat16", "float32", False, "int32", True)
+    k1 = embedding_grad_reduce_kernel(vocab, H, "bfloat16", "float32", False, "int32")
+    k2 = embedding_grad_reduce_kernel(vocab, H, "bfloat16", "float32", False, "int32")
     assert k1 is k2
     for nt in (10, 300):
         ids = _rand_ids(nt, vocab, seed=22)
