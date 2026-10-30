@@ -139,7 +139,7 @@ def embedding_grad_reduce_prepare_fwd(scale_by_freq=False, id_dtype="int32"):
     if scale_by_freq:
 
         @T.prim_func
-        def main(
+        def prepare(
             Ids: T.Tensor((n,), id_dtype),
             SrcOut: T.Tensor((cap,), "int32"),
             DstOut: T.Tensor((cap,), "int32"),
@@ -172,10 +172,10 @@ def embedding_grad_reduce_prepare_fwd(scale_by_freq=False, id_dtype="int32"):
                 T.copy(dst_ub, DstOut[obase : obase + PREP_BLK])
                 Hits[core] = pos
 
-        return main
+        return prepare
 
     @T.prim_func
-    def main(
+    def prepare(
         Ids: T.Tensor((n,), id_dtype),
         SrcOut: T.Tensor((cap,), "int32"),
         DstOut: T.Tensor((cap,), "int32"),
@@ -206,7 +206,7 @@ def embedding_grad_reduce_prepare_fwd(scale_by_freq=False, id_dtype="int32"):
             T.copy(dst_ub, DstOut[obase : obase + PREP_BLK])
             Hits[core] = pos
 
-    return main
+    return prepare
 
 
 def embedding_grad_reduce_zero_fwd():
@@ -214,14 +214,14 @@ def embedding_grad_reduce_zero_fwd():
     rows = T.dynamic("rows")
 
     @T.prim_func
-    def main(Counts: T.Tensor((rows,), "int32")):
+    def zero(Counts: T.Tensor((rows,), "int32")):
         with T.Kernel(NUM_AIV) as core:
             chunk = (rows + NUM_AIV - 1) // NUM_AIV
             with T.SimtVF(threads=512):
                 for j in T.Parallel(chunk):
                     Counts[T.min(core * chunk + j, rows - 1)] = 0
 
-    return main
+    return zero
 
 
 def embedding_grad_reduce_update_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype="float32"):
@@ -238,7 +238,7 @@ def embedding_grad_reduce_update_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype
     ntot = T.dynamic("ntot")
 
     @T.prim_func
-    def main(
+    def update(
         SrcRows: T.Tensor((cap,), "int32"),
         DstIds: T.Tensor((cap,), "int32"),
         Hits: T.Tensor((NUM_AIV,), "int32"),
@@ -260,7 +260,7 @@ def embedding_grad_reduce_update_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype
                 T.copy(acc_ub, GradWeight[DstIds[base + i], :])
             T.set_atomic_none()
 
-    return main
+    return update
 
 
 def embedding_grad_reduce_scaled_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype="float32"):
@@ -274,7 +274,7 @@ def embedding_grad_reduce_scaled_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype
     rows = T.dynamic("rows")
 
     @T.prim_func
-    def main(
+    def scaled_update(
         SrcRows: T.Tensor((cap,), "int32"),
         DstIds: T.Tensor((cap,), "int32"),
         Hits: T.Tensor((NUM_AIV,), "int32"),
@@ -299,7 +299,7 @@ def embedding_grad_reduce_scaled_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype
                 T.copy(acc_ub, GradWeight[row, :])
             T.set_atomic_none()
 
-    return main
+    return scaled_update
 
 
 def embedding_grad_reduce_whole_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype="float32", id_dtype="int32"):
@@ -311,7 +311,7 @@ def embedding_grad_reduce_whole_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype=
     n = T.dynamic("n")
 
     @T.prim_func
-    def main(
+    def whole(
         Ids: T.Tensor((n,), id_dtype),
         GradOut: T.Tensor((n, H), in_dtype),
         GradWeight: T.Tensor((num_rows, H), acc_dtype),
@@ -335,7 +335,7 @@ def embedding_grad_reduce_whole_fwd(num_rows, H, in_dtype="bfloat16", acc_dtype=
                 T.copy(acc_ub, GradWeight[Ids[tt], :])
             T.set_atomic_none()
 
-    return main
+    return whole
 
 
 @tilelang.jit(target="ascend")

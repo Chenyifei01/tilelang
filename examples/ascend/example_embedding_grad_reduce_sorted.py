@@ -8,6 +8,14 @@ writes the destination row once with a plain store (2 + 4 bytes per element).
 A row therefore has exactly one writer, which also makes the result bit-exact
 across repeated runs -- something the atomic path cannot promise.
 
+Wrapper note: unlike the shipped atomic example (whose preprocessing now runs
+inside a device kernel), this experimental variant still builds its group plan
+with torch NPU ops from Python -- ``torch.sort`` plus a handful of small
+metadata kernels. Moving that on device needs a counting sort written in
+TileLang (histogram -> per-core prefix -> cross-core offsets -> atomic scatter);
+budgeted at ~85-90 us it would cost more than the ~63 us plan it replaces, so
+it is deliberately left as a host-plan experiment for now.
+
 The price is moved into the wrapper: sorting ``n`` ids and building the group
 plan is O(n log n) host-side work spread over several small NPU kernels
 (~63 us at 32768 tokens, ~35 us at 4k tokens because launch overhead dominates).
