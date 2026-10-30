@@ -12,12 +12,13 @@ import torch
 import tilelang
 import tilelang.testing
 
+import example_embedding_grad_reduce
+
 from example_embedding_grad_reduce import (
     UB_PLAN,
     _pipeline_config,
+    _whole_kernel,
     embedding_grad_reduce,
-    embedding_grad_reduce_fwd,
-    embedding_grad_reduce_kernel,
     ref_program,
 )
 
@@ -189,8 +190,8 @@ def test_c11_no_hits_and_empty():
 def test_c12_dynamic_token_count_reuses_binary():
     """The token count is dynamic: one kernel object serves every hit count."""
     vocab, H = 16, 64
-    k1 = embedding_grad_reduce_kernel(vocab, H, "bfloat16", "float32", False)
-    k2 = embedding_grad_reduce_kernel(vocab, H, "bfloat16", "float32", False)
+    k1 = _whole_kernel(vocab, H, "bfloat16", "float32", "int32")
+    k2 = _whole_kernel(vocab, H, "bfloat16", "float32", "int32")
     assert k1 is k2
     for nt in (10, 300):
         ids = _rand_ids(nt, vocab, seed=22)
@@ -210,11 +211,11 @@ def test_c12_repeat_runs_are_stable(monkeypatch):
     go = _rand_grad(nt, H, seed=25)
     expect = _expect(go, ids, vocab)
     for _ in range(2):
-        kern = tilelang.compile(embedding_grad_reduce_fwd(vocab, H), target="ascend")
-        src_rows = torch.arange(nt, dtype=torch.int32, device="npu")
-        inv = torch.ones(nt, dtype=torch.float32, device="npu")
+        kern = tilelang.compile(
+            example_embedding_grad_reduce.embedding_grad_reduce_whole_fwd(vocab, H), target="ascend"
+        )
         out = torch.zeros(vocab, H, dtype=torch.float32, device="npu")
-        kern(ids, src_rows, inv, go, out)
+        kern(ids, go, out)
         torch.npu.synchronize()
         _assert_rows(out, expect)
 
