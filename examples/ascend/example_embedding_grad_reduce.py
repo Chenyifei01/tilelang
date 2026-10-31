@@ -9,29 +9,28 @@ on-chip reduction of the table itself: every token is one random row read plus
 one atomic row add.
 
 Everything runs on the NPU. The wrapper does no tensor arithmetic at all: it
-checks scalar preconditions and launches kernels. Two device kernels cover the
-general case:
+checks scalar preconditions and launches one kernel. That single kernel per
+core:
 
-``prepare``  each core scans its token slice, drops ids outside
-             ``[vocab_start, vocab_end)`` and the padding id, compacts the
-             survivors into per-core scratch lists and records its hit count
-             (optionally histogramming ids for ``scale_grad_by_freq``);
-``reduce``   each core iterates exactly its own hit count -- read the grad row,
-             cast to fp32, atomic-add it into the destination row.
+1. copies its own slice of ``indices`` into UB and, with a scalar pass, drops
+   ids outside ``[vocab_start, vocab_end)`` and the padding id while compacting
+   the survivors into the ``src_list`` (token) / ``dst_list`` (row) pair;
+2. runs a multi-buffered row pipeline over exactly the compacted count --
+   read ``grad_output[token]``, cast to fp32, atomic-add into
+   ``grad_weight[row]``.
 
-The full-table case (``vocab_start == 0``, no padding, no frequency scaling)
-skips ``prepare`` entirely: every token is a hit, so one kernel reads the ids
-directly and the whole thing is a single launch.
+Because each core's loop bound is its own hit count, no DMA and no atomic store
+is ever predicated on a runtime tail; the token slice is clamped by
+``PREP_BLK`` when copying, and every token past ``n`` is simply filtered out.
 
 The token count, the hit count and ``grad_output``'s row count are all dynamic,
 so one compiled binary serves every training step; only ``num_rows``/``H``/
-dtypes/``whole_table``/``scale_by_freq`` participate in specialization.
+dtypes/``scale_grad_by_freq`` participate in specialization. ``PREP_BLK`` caps
+the tokens a single core can take (``NUM_AIV * PREP_BLK`` = 86016 at the
+production shape), which the wrapper checks.
 
-Two disciplines carried over from ``embedding_lookup`` (see its design doc):
-MTE movement stays unconditional, and conditional work stays on the V pipe.
-The full-table chunk tail is handled by clamping the token index and scaling by
-0, never by guarding a DMA or atomic store. The compacted path needs no tail
-trick at all because each core's loop bound is its own hit count.
+One discipline carried over from ``embedding_lookup`` (see its design doc):
+MTE movement stays unconditional and conditional work stays on the V pipe.
 
 Duplicate ids are resolved by the hardware store-mode atomic add
 (``T.set_atomic("add", ...)``); the order is therefore not fixed, so repeated
@@ -364,7 +363,7 @@ def run_regression_perf(num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=1
 
 
 def run_sharded_perf(num_tokens=32768, H=7168, dtype="bfloat16", vocab_size=129280, tp=8):
-    """TP=``tp`` simulation: end-to-end wrapper (on-device prepare + reduce)."""
+    """TP=``tp`` simulation: end-to-end wrapper (on-device filter + atomic reduce)."""
     shard = vocab_size // tp
     ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int32).npu()
     go = torch.randn(num_tokens, H, device="npu").to(_STR_TO_TORCH[dtype])
