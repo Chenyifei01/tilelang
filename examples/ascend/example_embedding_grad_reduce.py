@@ -177,9 +177,16 @@ def embedding_grad_reduce_kernel(
       job). Each core scans only its own token slice, so the scan cost follows
       the hits instead of ``n``; every store is an atomic add.
 
-    ``Scales`` carries the per-token ``1/count`` weight when
-    ``scale_grad_by_freq`` is on. Duplicate ids accumulate; the order across
-    cores and tokens is not fixed (see the module docstring).
+    ``scale_grad_by_freq`` builds a second, otherwise identical prim_func
+    (``fused_scaled``) that additionally takes ``Scales`` and multiplies each
+    token's gradient by it: an optional input is a fixed-signature
+    specialization, and the default path must not have to pass a dummy
+    ``float32`` tensor (that would be host-side tensor work). Only the
+    selected variant is defined and traced per build -- exactly one binary is
+    produced and launched.
+
+    Duplicate ids accumulate; the order across cores and tokens is not fixed
+    (see the module docstring).
     """
     assert num_rows > 0 and H > 0
     assert id_dtype in ("int32", "int64")
@@ -192,405 +199,409 @@ def embedding_grad_reduce_kernel(
     n = T.dynamic("n")
     cast_ids = id_dtype != "int32"
 
-    @T.prim_func
-    def fused(
-        Ids: T.Tensor((n,), id_dtype),
-        GradOut: T.Tensor((n, H), in_dtype),
-        GradWeight: T.Tensor((num_rows, H), acc_dtype),
-        vocab_start: T.int32,
-        vocab_end: T.int32,
-        padding_idx: T.int32,
-    ):
-        with T.Kernel(NUM_AIV) as core:
-            id_src = T.alloc_shared((SCAN_BLK,), id_dtype)
-            id_blk = T.alloc_shared((SCAN_BLK,), "int32")
-            tok_list = T.alloc_shared((LIST_CAP,), "uint32")
-            row_list = T.alloc_shared((LIST_CAP,), "uint32")
-            bits_ub = T.alloc_shared((words,), "int32")
-            cnt_ub = T.alloc_shared((LANES,), "int32")
-            smp_ub = T.alloc_shared((LANES,), "int32")
-            plain_tok = T.alloc_shared((DRAIN_CAP,), "int32")
-            plain_row = T.alloc_shared((DRAIN_CAP,), "int32")
-            atom_tok = T.alloc_shared((DRAIN_CAP,), "int32")
-            atom_row = T.alloc_shared((DRAIN_CAP,), "int32")
-            src_ub = T.alloc_shared((H,), in_dtype)
-            acc_ub = T.alloc_shared((H,), acc_dtype)
-            T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
+    if not scale_grad_by_freq:
+        @T.prim_func
+        def fused(
+            Ids: T.Tensor((n,), id_dtype),
+            GradOut: T.Tensor((n, H), in_dtype),
+            GradWeight: T.Tensor((num_rows, H), acc_dtype),
+            vocab_start: T.int32,
+            vocab_end: T.int32,
+            padding_idx: T.int32,
+        ):
+            with T.Kernel(NUM_AIV) as core:
+                id_src = T.alloc_shared((SCAN_BLK,), id_dtype)
+                id_blk = T.alloc_shared((SCAN_BLK,), "int32")
+                tok_list = T.alloc_shared((LIST_CAP,), "uint32")
+                row_list = T.alloc_shared((LIST_CAP,), "uint32")
+                bits_ub = T.alloc_shared((words,), "int32")
+                cnt_ub = T.alloc_shared((LANES,), "int32")
+                smp_ub = T.alloc_shared((LANES,), "int32")
+                plain_tok = T.alloc_shared((DRAIN_CAP,), "int32")
+                plain_row = T.alloc_shared((DRAIN_CAP,), "int32")
+                atom_tok = T.alloc_shared((DRAIN_CAP,), "int32")
+                atom_row = T.alloc_shared((DRAIN_CAP,), "int32")
+                src_ub = T.alloc_shared((H,), in_dtype)
+                acc_ub = T.alloc_shared((H,), acc_dtype)
+                T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
 
-            lo = vocab_start + core * R
-            hi = T.min(vocab_start + (core + 1) * R, vocab_end)
-            nblk = T.ceildiv(n, SCAN_BLK)
+                lo = vocab_start + core * R
+                hi = T.min(vocab_start + (core + 1) * R, vocab_end)
+                nblk = T.ceildiv(n, SCAN_BLK)
 
-            for w in T.serial(words):
-                bits_ub[w] = 0
-            with T.SimdVF():
-                full0 = S.pset(32, 'PAT_ALL')
-                S.vsts(cnt_ub[0], S.vdup(0, T.int32, full0), full0)
-            T.ascend_pipe_barrier("PIPE_V")
+                for w in T.serial(words):
+                    bits_ub[w] = 0
+                with T.SimdVF():
+                    full0 = S.pset(32, 'PAT_ALL')
+                    S.vsts(cnt_ub[0], S.vdup(0, T.int32, full0), full0)
+                T.ascend_pipe_barrier("PIPE_V")
 
-            # Which strategy? Sample the first block for the *shard* hit ratio.
-            # Every core sees the same value, so all cores agree -- mixing the
-            # two strategies would let a plain store and an atomic add race on
-            # the same row.
-            if cast_ids:
-                T.copy(Ids[0 : SCAN_BLK], id_src)
-                with T.SimtVF(threads=vf_threads):
-                    for j in T.Parallel(SCAN_BLK):
-                        id_blk[j] = T.cast(id_src[j], "int32")
-            else:
-                T.copy(Ids[0 : SCAN_BLK], id_blk)
-            T.ascend_pipe_barrier("PIPE_MTE2")
-            with T.SimdVF():
-                full = S.pset(32, 'PAT_ALL')
-                zero = S.vdup(0, T.int32, full)
-                one = S.vdup(1, T.int32, full)
-                idx = S.vci(T.int32(0), "int32")
-                lane_last = S.vdup(LANES - 1, T.int32, full)
-                base = S.alloc_var(T.int32)
-                base = zero
-                for c in range(SCAN_BLK // LANES):
-                    v = S.vld(id_blk[c * LANES])
-                    tok = S.vci(T.int32(c * LANES), "int32")
-                    # Shard membership only: identical on every core, so the
-                    # strategy choice cannot differ between cores (a mix of
-                    # row-partitioned plain stores and token-partitioned
-                    # atomic adds would race on the same row).
-                    m = S.pand(S.vcmps(v, vocab_start, full, 'ge'), S.vcmps(v, vocab_end, full, 'lt'), full)
-                    m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
-                    m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
-                    x = S.vsel(one, zero, m)
-                    for s in (1, 2, 4, 8, 16, 32):
-                        sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
-                        sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
-                        x = S.vadd(x, sh, full)
-                    base = S.vadd(base, S.vselr(x, lane_last), full)
-                S.vsts(smp_ub[0], base, full)
-            T.ascend_pipe_barrier("PIPE_V")
-            high = T.if_then_else(4 * smp_ub[0] >= T.min(SCAN_BLK, n), 1, 0)
-            # The token partition buffers every hit of one core, so it needs
-            # the slice to fit the list.
-            too_big = T.if_then_else(LIST_CAP < T.ceildiv(n, NUM_AIV), 1, 0)
-            row_mode = T.if_then_else(T.max(high, too_big) != 0, 1, 0)
+                # Which strategy? Sample the first block for the *shard* hit ratio.
+                # Every core sees the same value, so all cores agree -- mixing the
+                # two strategies would let a plain store and an atomic add race on
+                # the same row.
+                if cast_ids:
+                    T.copy(Ids[0 : SCAN_BLK], id_src)
+                    with T.SimtVF(threads=vf_threads):
+                        for j in T.Parallel(SCAN_BLK):
+                            id_blk[j] = T.cast(id_src[j], "int32")
+                else:
+                    T.copy(Ids[0 : SCAN_BLK], id_blk)
+                T.ascend_pipe_barrier("PIPE_MTE2")
+                with T.SimdVF():
+                    full = S.pset(32, 'PAT_ALL')
+                    zero = S.vdup(0, T.int32, full)
+                    one = S.vdup(1, T.int32, full)
+                    idx = S.vci(T.int32(0), "int32")
+                    lane_last = S.vdup(LANES - 1, T.int32, full)
+                    base = S.alloc_var(T.int32)
+                    base = zero
+                    for c in range(SCAN_BLK // LANES):
+                        v = S.vld(id_blk[c * LANES])
+                        tok = S.vci(T.int32(c * LANES), "int32")
+                        # Shard membership only: identical on every core, so the
+                        # strategy choice cannot differ between cores (a mix of
+                        # row-partitioned plain stores and token-partitioned
+                        # atomic adds would race on the same row).
+                        m = S.pand(S.vcmps(v, vocab_start, full, 'ge'), S.vcmps(v, vocab_end, full, 'lt'), full)
+                        m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
+                        m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
+                        x = S.vsel(one, zero, m)
+                        for s in (1, 2, 4, 8, 16, 32):
+                            sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
+                            sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
+                            x = S.vadd(x, sh, full)
+                        base = S.vadd(base, S.vselr(x, lane_last), full)
+                    S.vsts(smp_ub[0], base, full)
+                T.ascend_pipe_barrier("PIPE_V")
+                high = T.if_then_else(4 * smp_ub[0] >= T.min(SCAN_BLK, n), 1, 0)
+                # The token partition buffers every hit of one core, so it needs
+                # the slice to fit the list.
+                too_big = T.if_then_else(LIST_CAP < T.ceildiv(n, NUM_AIV), 1, 0)
+                row_mode = T.if_then_else(T.max(high, too_big) != 0, 1, 0)
 
-            # ---- row partition: one writer per row, plain store then adds ----
-            # One extra block past the end so the tail drain always runs; the
-            # overflow read is masked by `tok < n` inside the scan.
-            for blk in T.serial(nblk + 1):
-                if row_mode == 1:
-                    if cast_ids:
-                        T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_src)
-                        with T.SimtVF(threads=vf_threads):
-                            for j in T.Parallel(SCAN_BLK):
-                                id_blk[j] = T.cast(id_src[j], "int32")
-                    else:
-                        T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_blk)
-                    T.ascend_pipe_barrier("PIPE_MTE2")
-                    with T.SimdVF():
-                        full = S.pset(32, 'PAT_ALL')
-                        zero = S.vdup(0, T.int32, full)
-                        one = S.vdup(1, T.int32, full)
-                        neg_one = S.vdup(-1, T.int32, full)
-                        idx = S.vci(T.int32(0), "int32")
-                        lane_last = S.vdup(LANES - 1, T.int32, full)
-                        base = S.alloc_var(T.int32)
-                        base = S.vld(cnt_ub[0])
-                        for c in range(SCAN_BLK // LANES):
-                            v = S.vld(id_blk[c * LANES])
-                            tok = S.vci(T.int32(blk * SCAN_BLK + c * LANES), "int32")
-                            m = S.pand(S.vcmps(v, lo, full, 'ge'), S.vcmps(v, hi, full, 'lt'), full)
-                            m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
-                            m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
-                            x = S.vsel(one, zero, m)
-                            for s in (1, 2, 4, 8, 16, 32):
-                                sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
-                                sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
-                                x = S.vadd(x, sh, full)
-                            p = S.vadd(S.vadd(x, neg_one, full), base, full)
-                            p = S.vsel(p, zero, m)
-                            S.vscatter(T.reinterpret(tok, "uint32x64"), tok_list[0],
-                                       T.reinterpret(p, "uint32x64"), m)
-                            S.vscatter(T.reinterpret(S.vadd(v, S.vdup(-vocab_start, T.int32, full), full),
-                                                     "uint32x64"), row_list[0],
-                                       T.reinterpret(p, "uint32x64"), m)
-                            base = S.vadd(base, S.vselr(x, lane_last), full)
-                        S.vsts(cnt_ub[0], base, full)
-                    T.ascend_pipe_barrier("PIPE_V")
-
-                    need = T.if_then_else(DRAIN_CAP <= cnt_ub[0], 1,
-                                          T.if_then_else(blk == nblk, 1, 0))
-                    if need != 0:
-                        np_ = T.alloc_var("int32", init=0)
-                        na_ = T.alloc_var("int32", init=0)
-                        cnt = T.min(cnt_ub[0], LIST_CAP)
-                        for i in T.serial(cnt):
-                            grow = T.cast(row_list[i], "int32")
-                            row = grow - core * R
-                            cur = bits_ub[row >> 5]
-                            # (cur >> s) & 1 rather than (cur & (1 << s)): with
-                            # s == 31 the masked value is INT32_MIN and the
-                            # duplicated `0 < x` test the backend emits would
-                            # drop every repeat for that row.
-                            hit = (cur >> (row & 31)) & 1
-                            if hit == 0:
-                                bits_ub[row >> 5] = cur | (1 << (row & 31))
-                                plain_tok[np_] = T.cast(tok_list[i], "int32")
-                                plain_row[np_] = grow
-                                np_ += 1
-                            else:
-                                atom_tok[na_] = T.cast(tok_list[i], "int32")
-                                atom_row[na_] = grow
-                                na_ += 1
-                        for i in T.Pipelined(np_, num_stages=num_stages):
-                            T.copy(GradOut[plain_tok[i], :], src_ub)
+                # ---- row partition: one writer per row, plain store then adds ----
+                # One extra block past the end so the tail drain always runs; the
+                # overflow read is masked by `tok < n` inside the scan.
+                for blk in T.serial(nblk + 1):
+                    if row_mode == 1:
+                        if cast_ids:
+                            T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_src)
                             with T.SimtVF(threads=vf_threads):
-                                for j in T.Parallel(H):
-                                    acc_ub[j] = T.cast(src_ub[j], acc_dtype)
-                            T.copy(acc_ub, GradWeight[plain_row[i], :])
-                        T.set_atomic("add", acc_dtype)
-                        for i in T.Pipelined(na_, num_stages=num_stages):
-                            T.copy(GradOut[atom_tok[i], :], src_ub)
-                            with T.SimtVF(threads=vf_threads):
-                                for j in T.Parallel(H):
-                                    acc_ub[j] = T.cast(src_ub[j], acc_dtype)
-                            T.copy(acc_ub, GradWeight[atom_row[i], :])
-                        T.set_atomic_none()
+                                for j in T.Parallel(SCAN_BLK):
+                                    id_blk[j] = T.cast(id_src[j], "int32")
+                        else:
+                            T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_blk)
+                        T.ascend_pipe_barrier("PIPE_MTE2")
                         with T.SimdVF():
-                            full_r = S.pset(32, 'PAT_ALL')
-                            S.vsts(cnt_ub[0], S.vdup(0, T.int32, full_r), full_r)
+                            full = S.pset(32, 'PAT_ALL')
+                            zero = S.vdup(0, T.int32, full)
+                            one = S.vdup(1, T.int32, full)
+                            neg_one = S.vdup(-1, T.int32, full)
+                            idx = S.vci(T.int32(0), "int32")
+                            lane_last = S.vdup(LANES - 1, T.int32, full)
+                            base = S.alloc_var(T.int32)
+                            base = S.vld(cnt_ub[0])
+                            for c in range(SCAN_BLK // LANES):
+                                v = S.vld(id_blk[c * LANES])
+                                tok = S.vci(T.int32(blk * SCAN_BLK + c * LANES), "int32")
+                                m = S.pand(S.vcmps(v, lo, full, 'ge'), S.vcmps(v, hi, full, 'lt'), full)
+                                m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
+                                m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
+                                x = S.vsel(one, zero, m)
+                                for s in (1, 2, 4, 8, 16, 32):
+                                    sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
+                                    sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
+                                    x = S.vadd(x, sh, full)
+                                p = S.vadd(S.vadd(x, neg_one, full), base, full)
+                                p = S.vsel(p, zero, m)
+                                S.vscatter(T.reinterpret(tok, "uint32x64"), tok_list[0],
+                                           T.reinterpret(p, "uint32x64"), m)
+                                S.vscatter(T.reinterpret(S.vadd(v, S.vdup(-vocab_start, T.int32, full), full),
+                                                         "uint32x64"), row_list[0],
+                                           T.reinterpret(p, "uint32x64"), m)
+                                base = S.vadd(base, S.vselr(x, lane_last), full)
+                            S.vsts(cnt_ub[0], base, full)
                         T.ascend_pipe_barrier("PIPE_V")
 
-            # ---- token partition: scan only this core's slice, all-atomic ----
-            if row_mode == 0:
-                pos = T.alloc_var("int32", init=0)
-                chunk = T.ceildiv(n, NUM_AIV)
-                tbase = core * chunk
-                for b in T.serial(T.ceildiv(chunk, SCAN_BLK)):
-                    if cast_ids:
-                        T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_src)
+                        need = T.if_then_else(DRAIN_CAP <= cnt_ub[0], 1,
+                                              T.if_then_else(blk == nblk, 1, 0))
+                        if need != 0:
+                            np_ = T.alloc_var("int32", init=0)
+                            na_ = T.alloc_var("int32", init=0)
+                            cnt = T.min(cnt_ub[0], LIST_CAP)
+                            for i in T.serial(cnt):
+                                grow = T.cast(row_list[i], "int32")
+                                row = grow - core * R
+                                cur = bits_ub[row >> 5]
+                                # (cur >> s) & 1 rather than (cur & (1 << s)): with
+                                # s == 31 the masked value is INT32_MIN and the
+                                # duplicated `0 < x` test the backend emits would
+                                # drop every repeat for that row.
+                                hit = (cur >> (row & 31)) & 1
+                                if hit == 0:
+                                    bits_ub[row >> 5] = cur | (1 << (row & 31))
+                                    plain_tok[np_] = T.cast(tok_list[i], "int32")
+                                    plain_row[np_] = grow
+                                    np_ += 1
+                                else:
+                                    atom_tok[na_] = T.cast(tok_list[i], "int32")
+                                    atom_row[na_] = grow
+                                    na_ += 1
+                            for i in T.Pipelined(np_, num_stages=num_stages):
+                                T.copy(GradOut[plain_tok[i], :], src_ub)
+                                with T.SimtVF(threads=vf_threads):
+                                    for j in T.Parallel(H):
+                                        acc_ub[j] = T.cast(src_ub[j], acc_dtype)
+                                T.copy(acc_ub, GradWeight[plain_row[i], :])
+                            T.set_atomic("add", acc_dtype)
+                            for i in T.Pipelined(na_, num_stages=num_stages):
+                                T.copy(GradOut[atom_tok[i], :], src_ub)
+                                with T.SimtVF(threads=vf_threads):
+                                    for j in T.Parallel(H):
+                                        acc_ub[j] = T.cast(src_ub[j], acc_dtype)
+                                T.copy(acc_ub, GradWeight[atom_row[i], :])
+                            T.set_atomic_none()
+                            with T.SimdVF():
+                                full_r = S.pset(32, 'PAT_ALL')
+                                S.vsts(cnt_ub[0], S.vdup(0, T.int32, full_r), full_r)
+                            T.ascend_pipe_barrier("PIPE_V")
+
+                # ---- token partition: scan only this core's slice, all-atomic ----
+                if row_mode == 0:
+                    pos = T.alloc_var("int32", init=0)
+                    chunk = T.ceildiv(n, NUM_AIV)
+                    tbase = core * chunk
+                    for b in T.serial(T.ceildiv(chunk, SCAN_BLK)):
+                        if cast_ids:
+                            T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_src)
+                            with T.SimtVF(threads=vf_threads):
+                                for j in T.Parallel(SCAN_BLK):
+                                    id_blk[j] = T.cast(id_src[j], "int32")
+                        else:
+                            T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_blk)
+                        for j in T.serial(T.min(SCAN_BLK, chunk - b * SCAN_BLK)):
+                            t = tbase + b * SCAN_BLK + j
+                            idv = id_blk[j]
+                            if (t < n) and (vocab_start <= idv) and (idv < vocab_end) and (idv != padding_idx):
+                                tok_list[pos] = T.cast(t, "uint32")
+                                row_list[pos] = T.cast(idv - vocab_start, "uint32")
+                                pos += 1
+                    T.set_atomic("add", acc_dtype)
+                    for i in T.Pipelined(pos, num_stages=num_stages):
+                        tok = T.cast(tok_list[i], "int32")
+                        T.copy(GradOut[tok, :], src_ub)
                         with T.SimtVF(threads=vf_threads):
-                            for j in T.Parallel(SCAN_BLK):
-                                id_blk[j] = T.cast(id_src[j], "int32")
-                    else:
-                        T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_blk)
-                    for j in T.serial(T.min(SCAN_BLK, chunk - b * SCAN_BLK)):
-                        t = tbase + b * SCAN_BLK + j
-                        idv = id_blk[j]
-                        if (t < n) and (vocab_start <= idv) and (idv < vocab_end) and (idv != padding_idx):
-                            tok_list[pos] = T.cast(t, "uint32")
-                            row_list[pos] = T.cast(idv - vocab_start, "uint32")
-                            pos += 1
-                T.set_atomic("add", acc_dtype)
-                for i in T.Pipelined(pos, num_stages=num_stages):
-                    tok = T.cast(tok_list[i], "int32")
-                    T.copy(GradOut[tok, :], src_ub)
+                            for j in T.Parallel(H):
+                                acc_ub[j] = T.cast(src_ub[j], acc_dtype)
+                        T.copy(acc_ub, GradWeight[T.cast(row_list[i], "int32"), :])
+                    T.set_atomic_none()
+
+        return fused
+
+    else:
+        @T.prim_func
+        def fused_scaled(
+            Ids: T.Tensor((n,), id_dtype),
+            Scales: T.Tensor((n,), "float32"),
+            GradOut: T.Tensor((n, H), in_dtype),
+            GradWeight: T.Tensor((num_rows, H), acc_dtype),
+            vocab_start: T.int32,
+            vocab_end: T.int32,
+            padding_idx: T.int32,
+        ):
+            with T.Kernel(NUM_AIV) as core:
+                id_src = T.alloc_shared((SCAN_BLK,), id_dtype)
+                id_blk = T.alloc_shared((SCAN_BLK,), "int32")
+                tok_list = T.alloc_shared((LIST_CAP,), "uint32")
+                row_list = T.alloc_shared((LIST_CAP,), "uint32")
+                bits_ub = T.alloc_shared((words,), "int32")
+                cnt_ub = T.alloc_shared((LANES,), "int32")
+                smp_ub = T.alloc_shared((LANES,), "int32")
+                plain_tok = T.alloc_shared((DRAIN_CAP,), "int32")
+                plain_row = T.alloc_shared((DRAIN_CAP,), "int32")
+                atom_tok = T.alloc_shared((DRAIN_CAP,), "int32")
+                atom_row = T.alloc_shared((DRAIN_CAP,), "int32")
+                src_ub = T.alloc_shared((H,), in_dtype)
+                acc_ub = T.alloc_shared((H,), acc_dtype)
+                T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
+
+                lo = vocab_start + core * R
+                hi = T.min(vocab_start + (core + 1) * R, vocab_end)
+                nblk = T.ceildiv(n, SCAN_BLK)
+
+                for w in T.serial(words):
+                    bits_ub[w] = 0
+                with T.SimdVF():
+                    full0 = S.pset(32, 'PAT_ALL')
+                    S.vsts(cnt_ub[0], S.vdup(0, T.int32, full0), full0)
+                T.ascend_pipe_barrier("PIPE_V")
+
+                # Which strategy? Sample the first block for the *shard* hit ratio.
+                # Every core sees the same value, so all cores agree -- mixing the
+                # two strategies would let a plain store and an atomic add race on
+                # the same row.
+                if cast_ids:
+                    T.copy(Ids[0 : SCAN_BLK], id_src)
                     with T.SimtVF(threads=vf_threads):
-                        for j in T.Parallel(H):
-                            acc_ub[j] = T.cast(src_ub[j], acc_dtype)
-                    T.copy(acc_ub, GradWeight[T.cast(row_list[i], "int32"), :])
-                T.set_atomic_none()
+                        for j in T.Parallel(SCAN_BLK):
+                            id_blk[j] = T.cast(id_src[j], "int32")
+                else:
+                    T.copy(Ids[0 : SCAN_BLK], id_blk)
+                T.ascend_pipe_barrier("PIPE_MTE2")
+                with T.SimdVF():
+                    full = S.pset(32, 'PAT_ALL')
+                    zero = S.vdup(0, T.int32, full)
+                    one = S.vdup(1, T.int32, full)
+                    idx = S.vci(T.int32(0), "int32")
+                    lane_last = S.vdup(LANES - 1, T.int32, full)
+                    base = S.alloc_var(T.int32)
+                    base = zero
+                    for c in range(SCAN_BLK // LANES):
+                        v = S.vld(id_blk[c * LANES])
+                        tok = S.vci(T.int32(c * LANES), "int32")
+                        # Shard membership only: identical on every core, so the
+                        # strategy choice cannot differ between cores (a mix of
+                        # row-partitioned plain stores and token-partitioned
+                        # atomic adds would race on the same row).
+                        m = S.pand(S.vcmps(v, vocab_start, full, 'ge'), S.vcmps(v, vocab_end, full, 'lt'), full)
+                        m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
+                        m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
+                        x = S.vsel(one, zero, m)
+                        for s in (1, 2, 4, 8, 16, 32):
+                            sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
+                            sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
+                            x = S.vadd(x, sh, full)
+                        base = S.vadd(base, S.vselr(x, lane_last), full)
+                    S.vsts(smp_ub[0], base, full)
+                T.ascend_pipe_barrier("PIPE_V")
+                high = T.if_then_else(4 * smp_ub[0] >= T.min(SCAN_BLK, n), 1, 0)
+                # The token partition buffers every hit of one core, so it needs
+                # the slice to fit the list.
+                too_big = T.if_then_else(LIST_CAP < T.ceildiv(n, NUM_AIV), 1, 0)
+                row_mode = T.if_then_else(T.max(high, too_big) != 0, 1, 0)
 
-    @T.prim_func
-    def fused_scaled(
-        Ids: T.Tensor((n,), id_dtype),
-        Scales: T.Tensor((n,), "float32"),
-        GradOut: T.Tensor((n, H), in_dtype),
-        GradWeight: T.Tensor((num_rows, H), acc_dtype),
-        vocab_start: T.int32,
-        vocab_end: T.int32,
-        padding_idx: T.int32,
-    ):
-        with T.Kernel(NUM_AIV) as core:
-            id_src = T.alloc_shared((SCAN_BLK,), id_dtype)
-            id_blk = T.alloc_shared((SCAN_BLK,), "int32")
-            tok_list = T.alloc_shared((LIST_CAP,), "uint32")
-            row_list = T.alloc_shared((LIST_CAP,), "uint32")
-            bits_ub = T.alloc_shared((words,), "int32")
-            cnt_ub = T.alloc_shared((LANES,), "int32")
-            smp_ub = T.alloc_shared((LANES,), "int32")
-            plain_tok = T.alloc_shared((DRAIN_CAP,), "int32")
-            plain_row = T.alloc_shared((DRAIN_CAP,), "int32")
-            atom_tok = T.alloc_shared((DRAIN_CAP,), "int32")
-            atom_row = T.alloc_shared((DRAIN_CAP,), "int32")
-            src_ub = T.alloc_shared((H,), in_dtype)
-            acc_ub = T.alloc_shared((H,), acc_dtype)
-            T.annotate_buffer_versions({src_ub: versions, acc_ub: versions})
-
-            lo = vocab_start + core * R
-            hi = T.min(vocab_start + (core + 1) * R, vocab_end)
-            nblk = T.ceildiv(n, SCAN_BLK)
-
-            for w in T.serial(words):
-                bits_ub[w] = 0
-            with T.SimdVF():
-                full0 = S.pset(32, 'PAT_ALL')
-                S.vsts(cnt_ub[0], S.vdup(0, T.int32, full0), full0)
-            T.ascend_pipe_barrier("PIPE_V")
-
-            # Which strategy? Sample the first block for the *shard* hit ratio.
-            # Every core sees the same value, so all cores agree -- mixing the
-            # two strategies would let a plain store and an atomic add race on
-            # the same row.
-            if cast_ids:
-                T.copy(Ids[0 : SCAN_BLK], id_src)
-                with T.SimtVF(threads=vf_threads):
-                    for j in T.Parallel(SCAN_BLK):
-                        id_blk[j] = T.cast(id_src[j], "int32")
-            else:
-                T.copy(Ids[0 : SCAN_BLK], id_blk)
-            T.ascend_pipe_barrier("PIPE_MTE2")
-            with T.SimdVF():
-                full = S.pset(32, 'PAT_ALL')
-                zero = S.vdup(0, T.int32, full)
-                one = S.vdup(1, T.int32, full)
-                idx = S.vci(T.int32(0), "int32")
-                lane_last = S.vdup(LANES - 1, T.int32, full)
-                base = S.alloc_var(T.int32)
-                base = zero
-                for c in range(SCAN_BLK // LANES):
-                    v = S.vld(id_blk[c * LANES])
-                    tok = S.vci(T.int32(c * LANES), "int32")
-                    # Shard membership only: identical on every core, so the
-                    # strategy choice cannot differ between cores (a mix of
-                    # row-partitioned plain stores and token-partitioned
-                    # atomic adds would race on the same row).
-                    m = S.pand(S.vcmps(v, vocab_start, full, 'ge'), S.vcmps(v, vocab_end, full, 'lt'), full)
-                    m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
-                    m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
-                    x = S.vsel(one, zero, m)
-                    for s in (1, 2, 4, 8, 16, 32):
-                        sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
-                        sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
-                        x = S.vadd(x, sh, full)
-                    base = S.vadd(base, S.vselr(x, lane_last), full)
-                S.vsts(smp_ub[0], base, full)
-            T.ascend_pipe_barrier("PIPE_V")
-            high = T.if_then_else(4 * smp_ub[0] >= T.min(SCAN_BLK, n), 1, 0)
-            # The token partition buffers every hit of one core, so it needs
-            # the slice to fit the list.
-            too_big = T.if_then_else(LIST_CAP < T.ceildiv(n, NUM_AIV), 1, 0)
-            row_mode = T.if_then_else(T.max(high, too_big) != 0, 1, 0)
-
-            # ---- row partition: one writer per row, plain store then adds ----
-            # One extra block past the end so the tail drain always runs; the
-            # overflow read is masked by `tok < n` inside the scan.
-            for blk in T.serial(nblk + 1):
-                if row_mode == 1:
-                    if cast_ids:
-                        T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_src)
-                        with T.SimtVF(threads=vf_threads):
-                            for j in T.Parallel(SCAN_BLK):
-                                id_blk[j] = T.cast(id_src[j], "int32")
-                    else:
-                        T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_blk)
-                    T.ascend_pipe_barrier("PIPE_MTE2")
-                    with T.SimdVF():
-                        full = S.pset(32, 'PAT_ALL')
-                        zero = S.vdup(0, T.int32, full)
-                        one = S.vdup(1, T.int32, full)
-                        neg_one = S.vdup(-1, T.int32, full)
-                        idx = S.vci(T.int32(0), "int32")
-                        lane_last = S.vdup(LANES - 1, T.int32, full)
-                        base = S.alloc_var(T.int32)
-                        base = S.vld(cnt_ub[0])
-                        for c in range(SCAN_BLK // LANES):
-                            v = S.vld(id_blk[c * LANES])
-                            tok = S.vci(T.int32(blk * SCAN_BLK + c * LANES), "int32")
-                            m = S.pand(S.vcmps(v, lo, full, 'ge'), S.vcmps(v, hi, full, 'lt'), full)
-                            m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
-                            m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
-                            x = S.vsel(one, zero, m)
-                            for s in (1, 2, 4, 8, 16, 32):
-                                sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
-                                sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
-                                x = S.vadd(x, sh, full)
-                            p = S.vadd(S.vadd(x, neg_one, full), base, full)
-                            p = S.vsel(p, zero, m)
-                            S.vscatter(T.reinterpret(tok, "uint32x64"), tok_list[0],
-                                       T.reinterpret(p, "uint32x64"), m)
-                            S.vscatter(T.reinterpret(S.vadd(v, S.vdup(-vocab_start, T.int32, full), full),
-                                                     "uint32x64"), row_list[0],
-                                       T.reinterpret(p, "uint32x64"), m)
-                            base = S.vadd(base, S.vselr(x, lane_last), full)
-                        S.vsts(cnt_ub[0], base, full)
-                    T.ascend_pipe_barrier("PIPE_V")
-
-                    need = T.if_then_else(DRAIN_CAP <= cnt_ub[0], 1,
-                                          T.if_then_else(blk == nblk, 1, 0))
-                    if need != 0:
-                        np_ = T.alloc_var("int32", init=0)
-                        na_ = T.alloc_var("int32", init=0)
-                        cnt = T.min(cnt_ub[0], LIST_CAP)
-                        for i in T.serial(cnt):
-                            grow = T.cast(row_list[i], "int32")
-                            row = grow - core * R
-                            cur = bits_ub[row >> 5]
-                            # (cur >> s) & 1 rather than (cur & (1 << s)): with
-                            # s == 31 the masked value is INT32_MIN and the
-                            # duplicated `0 < x` test the backend emits would
-                            # drop every repeat for that row.
-                            hit = (cur >> (row & 31)) & 1
-                            if hit == 0:
-                                bits_ub[row >> 5] = cur | (1 << (row & 31))
-                                plain_tok[np_] = T.cast(tok_list[i], "int32")
-                                plain_row[np_] = grow
-                                np_ += 1
-                            else:
-                                atom_tok[na_] = T.cast(tok_list[i], "int32")
-                                atom_row[na_] = grow
-                                na_ += 1
-                        for i in T.Pipelined(np_, num_stages=num_stages):
-                            scale = Scales[plain_tok[i]]
-                            T.copy(GradOut[plain_tok[i], :], src_ub)
+                # ---- row partition: one writer per row, plain store then adds ----
+                # One extra block past the end so the tail drain always runs; the
+                # overflow read is masked by `tok < n` inside the scan.
+                for blk in T.serial(nblk + 1):
+                    if row_mode == 1:
+                        if cast_ids:
+                            T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_src)
                             with T.SimtVF(threads=vf_threads):
-                                for j in T.Parallel(H):
-                                    acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
-                            T.copy(acc_ub, GradWeight[plain_row[i], :])
-                        T.set_atomic("add", acc_dtype)
-                        for i in T.Pipelined(na_, num_stages=num_stages):
-                            scale = Scales[atom_tok[i]]
-                            T.copy(GradOut[atom_tok[i], :], src_ub)
-                            with T.SimtVF(threads=vf_threads):
-                                for j in T.Parallel(H):
-                                    acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
-                            T.copy(acc_ub, GradWeight[atom_row[i], :])
-                        T.set_atomic_none()
+                                for j in T.Parallel(SCAN_BLK):
+                                    id_blk[j] = T.cast(id_src[j], "int32")
+                        else:
+                            T.copy(Ids[blk * SCAN_BLK : blk * SCAN_BLK + SCAN_BLK], id_blk)
+                        T.ascend_pipe_barrier("PIPE_MTE2")
                         with T.SimdVF():
-                            full_r = S.pset(32, 'PAT_ALL')
-                            S.vsts(cnt_ub[0], S.vdup(0, T.int32, full_r), full_r)
+                            full = S.pset(32, 'PAT_ALL')
+                            zero = S.vdup(0, T.int32, full)
+                            one = S.vdup(1, T.int32, full)
+                            neg_one = S.vdup(-1, T.int32, full)
+                            idx = S.vci(T.int32(0), "int32")
+                            lane_last = S.vdup(LANES - 1, T.int32, full)
+                            base = S.alloc_var(T.int32)
+                            base = S.vld(cnt_ub[0])
+                            for c in range(SCAN_BLK // LANES):
+                                v = S.vld(id_blk[c * LANES])
+                                tok = S.vci(T.int32(blk * SCAN_BLK + c * LANES), "int32")
+                                m = S.pand(S.vcmps(v, lo, full, 'ge'), S.vcmps(v, hi, full, 'lt'), full)
+                                m = S.pand(m, S.vcmp(v, S.vdup(padding_idx, T.int32, full), full, 'ne'), full)
+                                m = S.pand(m, S.vcmps(tok, n, full, 'lt'), full)
+                                x = S.vsel(one, zero, m)
+                                for s in (1, 2, 4, 8, 16, 32):
+                                    sidx = S.vmaxs(S.vadd(idx, S.vdup(-s, T.int32, full), full), 0, full)
+                                    sh = S.vsel(S.vselr(x, sidx), zero, S.vcmps(idx, s, full, 'ge'))
+                                    x = S.vadd(x, sh, full)
+                                p = S.vadd(S.vadd(x, neg_one, full), base, full)
+                                p = S.vsel(p, zero, m)
+                                S.vscatter(T.reinterpret(tok, "uint32x64"), tok_list[0],
+                                           T.reinterpret(p, "uint32x64"), m)
+                                S.vscatter(T.reinterpret(S.vadd(v, S.vdup(-vocab_start, T.int32, full), full),
+                                                         "uint32x64"), row_list[0],
+                                           T.reinterpret(p, "uint32x64"), m)
+                                base = S.vadd(base, S.vselr(x, lane_last), full)
+                            S.vsts(cnt_ub[0], base, full)
                         T.ascend_pipe_barrier("PIPE_V")
 
-            # ---- token partition: scan only this core's slice, all-atomic ----
-            if row_mode == 0:
-                pos = T.alloc_var("int32", init=0)
-                chunk = T.ceildiv(n, NUM_AIV)
-                tbase = core * chunk
-                for b in T.serial(T.ceildiv(chunk, SCAN_BLK)):
-                    if cast_ids:
-                        T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_src)
-                        with T.SimtVF(threads=vf_threads):
-                            for j in T.Parallel(SCAN_BLK):
-                                id_blk[j] = T.cast(id_src[j], "int32")
-                    else:
-                        T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_blk)
-                    for j in T.serial(T.min(SCAN_BLK, chunk - b * SCAN_BLK)):
-                        t = tbase + b * SCAN_BLK + j
-                        idv = id_blk[j]
-                        if (t < n) and (vocab_start <= idv) and (idv < vocab_end) and (idv != padding_idx):
-                            tok_list[pos] = T.cast(t, "uint32")
-                            row_list[pos] = T.cast(idv - vocab_start, "uint32")
-                            pos += 1
-                T.set_atomic("add", acc_dtype)
-                for i in T.Pipelined(pos, num_stages=num_stages):
-                    tok = T.cast(tok_list[i], "int32")
-                    scale = Scales[tok]
-                    T.copy(GradOut[tok, :], src_ub)
-                    with T.SimtVF(threads=vf_threads):
-                        for j in T.Parallel(H):
-                            acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
-                    T.copy(acc_ub, GradWeight[T.cast(row_list[i], "int32"), :])
-                T.set_atomic_none()
+                        need = T.if_then_else(DRAIN_CAP <= cnt_ub[0], 1,
+                                              T.if_then_else(blk == nblk, 1, 0))
+                        if need != 0:
+                            np_ = T.alloc_var("int32", init=0)
+                            na_ = T.alloc_var("int32", init=0)
+                            cnt = T.min(cnt_ub[0], LIST_CAP)
+                            for i in T.serial(cnt):
+                                grow = T.cast(row_list[i], "int32")
+                                row = grow - core * R
+                                cur = bits_ub[row >> 5]
+                                # (cur >> s) & 1 rather than (cur & (1 << s)): with
+                                # s == 31 the masked value is INT32_MIN and the
+                                # duplicated `0 < x` test the backend emits would
+                                # drop every repeat for that row.
+                                hit = (cur >> (row & 31)) & 1
+                                if hit == 0:
+                                    bits_ub[row >> 5] = cur | (1 << (row & 31))
+                                    plain_tok[np_] = T.cast(tok_list[i], "int32")
+                                    plain_row[np_] = grow
+                                    np_ += 1
+                                else:
+                                    atom_tok[na_] = T.cast(tok_list[i], "int32")
+                                    atom_row[na_] = grow
+                                    na_ += 1
+                            for i in T.Pipelined(np_, num_stages=num_stages):
+                                scale = Scales[plain_tok[i]]
+                                T.copy(GradOut[plain_tok[i], :], src_ub)
+                                with T.SimtVF(threads=vf_threads):
+                                    for j in T.Parallel(H):
+                                        acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
+                                T.copy(acc_ub, GradWeight[plain_row[i], :])
+                            T.set_atomic("add", acc_dtype)
+                            for i in T.Pipelined(na_, num_stages=num_stages):
+                                scale = Scales[atom_tok[i]]
+                                T.copy(GradOut[atom_tok[i], :], src_ub)
+                                with T.SimtVF(threads=vf_threads):
+                                    for j in T.Parallel(H):
+                                        acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
+                                T.copy(acc_ub, GradWeight[atom_row[i], :])
+                            T.set_atomic_none()
+                            with T.SimdVF():
+                                full_r = S.pset(32, 'PAT_ALL')
+                                S.vsts(cnt_ub[0], S.vdup(0, T.int32, full_r), full_r)
+                            T.ascend_pipe_barrier("PIPE_V")
 
-    return fused_scaled if scale_grad_by_freq else fused
+                # ---- token partition: scan only this core's slice, all-atomic ----
+                if row_mode == 0:
+                    pos = T.alloc_var("int32", init=0)
+                    chunk = T.ceildiv(n, NUM_AIV)
+                    tbase = core * chunk
+                    for b in T.serial(T.ceildiv(chunk, SCAN_BLK)):
+                        if cast_ids:
+                            T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_src)
+                            with T.SimtVF(threads=vf_threads):
+                                for j in T.Parallel(SCAN_BLK):
+                                    id_blk[j] = T.cast(id_src[j], "int32")
+                        else:
+                            T.copy(Ids[tbase + b * SCAN_BLK : tbase + b * SCAN_BLK + SCAN_BLK], id_blk)
+                        for j in T.serial(T.min(SCAN_BLK, chunk - b * SCAN_BLK)):
+                            t = tbase + b * SCAN_BLK + j
+                            idv = id_blk[j]
+                            if (t < n) and (vocab_start <= idv) and (idv < vocab_end) and (idv != padding_idx):
+                                tok_list[pos] = T.cast(t, "uint32")
+                                row_list[pos] = T.cast(idv - vocab_start, "uint32")
+                                pos += 1
+                    T.set_atomic("add", acc_dtype)
+                    for i in T.Pipelined(pos, num_stages=num_stages):
+                        tok = T.cast(tok_list[i], "int32")
+                        scale = Scales[tok]
+                        T.copy(GradOut[tok, :], src_ub)
+                        with T.SimtVF(threads=vf_threads):
+                            for j in T.Parallel(H):
+                                acc_ub[j] = T.cast(src_ub[j], acc_dtype) * scale
+                        T.copy(acc_ub, GradWeight[T.cast(row_list[i], "int32"), :])
+                    T.set_atomic_none()
+
+        return fused_scaled
 
 
 def ref_program(grad_output, indices, num_weights, padding_idx=-1, scale_grad_by_freq=False,
