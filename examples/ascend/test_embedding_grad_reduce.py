@@ -144,15 +144,25 @@ def test_c8_scale_grad_by_freq():
 
 
 @tilelang.testing.requires_ascend
-def test_c9_in_place_accumulation():
-    """``out=`` accumulates in place (MTP / repeated backward reuse)."""
+def test_c9_out_is_written_not_accumulated():
+    """``out=`` is written: a second call replaces the hit rows, and rows this
+    call never touches keep whatever the caller left in them."""
     vocab, H, nt = 32, 64, 128
     ids = _rand_ids(nt, vocab, seed=16)
     go = _rand_grad(nt, H, seed=17)
+    expect = _expect(go, ids, vocab)
     out = torch.zeros(vocab, H, dtype=torch.float32, device="npu")
     embedding_grad_reduce(go, ids, vocab, out=out)
+    _assert_rows(out, expect, tol=1e-6)
     embedding_grad_reduce(go, ids, vocab, out=out)
-    _assert_rows(out, _expect(go, ids, vocab) * 2, tol=2e-5)
+    _assert_rows(out, expect, tol=1e-6)  # overwritten, not doubled
+
+    ids2 = torch.full((8,), 3, dtype=torch.int32, device="npu")
+    go2 = _rand_grad(8, H, seed=18)
+    out2 = torch.full((vocab, H), 7.0, dtype=torch.float32, device="npu")
+    embedding_grad_reduce(go2, ids2, vocab, out=out2)
+    assert torch.all(out2[0] == 7.0), "untouched rows must keep the caller value"
+    _assert_rows(out2[3:4], _expect(go2, ids2, vocab)[3:4], tol=1e-6)
 
 
 @tilelang.testing.requires_ascend
