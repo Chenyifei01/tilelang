@@ -94,14 +94,20 @@ def _tile_config(H, esize):
 
 
 @tilelang.jit(out_idx=[2], target="ascend")
-def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
+def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype="int32"):
     """JIT-cached kernel per compile-time signature (design.md §3.1, §4.3).
 
-    ``num_tokens``/``shard_rows``/``H``/``dtype`` are compile-time specialized;
-    ``vocab_start``/``vocab_end`` stay runtime scalars so one binary serves all
-    TP sharding configs. The persistent grid is capped by the tile count, so
-    tiny batches shrink the grid. The AIV count is queried from the device
-    (950DT/950PR etc. differ) instead of being hard-coded.
+    ``num_tokens``/``shard_rows``/``H``/``dtype``/``ids_dtype`` are compile-time
+    specialized; ``vocab_start``/``vocab_end`` stay runtime scalars so one
+    binary serves all TP sharding configs. The persistent grid is capped by the
+    tile count, so tiny batches shrink the grid. The AIV count is queried from
+    the device (950DT/950PR etc. differ) instead of being hard-coded.
+
+    ``ids_dtype`` lets the kernel read int32 and int64 ids directly and narrow
+    them in the scalar path, instead of the wrapper launching a separate cast
+    kernel (measured 1.1-1.9 us of device time, plus one host dispatch, per
+    call). The narrow is lossless for ``vocab < 2^31``; only dtypes outside
+    {int32, int64} are still cast in the wrapper.
 
     A tile's rows leave in one block MTE3 (T8: +6% at H=7168, +16% at H=4096
     over the per-row store). That path needs the whole tile in range, so when
@@ -133,14 +139,14 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
 
     @T.prim_func
     def main(
-        Ids: T.Tensor((num_tokens,), "int32"),
+        Ids: T.Tensor((num_tokens,), ids_dtype),
         W: T.Tensor((shard_rows, H), dtype),
         Out: T.Tensor((out_rows, H), dtype),
         vocab_start: T.int32,
         vocab_end: T.int32,
     ):
         with T.Kernel(num_cores) as core_id:
-            ids_ub = T.alloc_shared((tile_t,), "int32")
+            ids_ub = T.alloc_shared((tile_t,), ids_dtype)
             row_ub = T.alloc_shared((tile_t, H), dtype)
             T.annotate_buffer_versions({row_ub: versions})
             for tile in T.Persistent([num_tiles], num_cores, core_id):
@@ -153,7 +159,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                 T.copy(Ids[t0 : t0 + tile_t], ids_ub)
                 if block_store:
                     for i in T.Pipelined(tile_t, num_stages=num_stages):
-                        tok_id = ids_ub[i]
+                        tok_id = T.cast(ids_ub[i], "int32")  # no-op for int32 ids
                         local = tok_id - vocab_start
                         hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
                         if skip_miss_load:  # 4-12 KiB rows: miss read is waste
@@ -172,7 +178,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                     for i in T.Pipelined(tile_t, num_stages=num_stages):
                         tk = t0 + i
                         if tk < num_tokens:  # tail-tile guard
-                            tok_id = ids_ub[i]
+                            tok_id = T.cast(ids_ub[i], "int32")  # no-op for int32
                             local = tok_id - vocab_start
                             hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
                             if skip_miss_load:  # 4-12 KiB rows: miss read is waste
@@ -206,14 +212,18 @@ def embedding_lookup(
     """Gather rows of ``weight`` for ids in ``[vocab_start_index, vocab_end_index)``;
     ids outside the range produce zero rows. Returns ``(*input_ids.shape, H)``.
 
-    Caller contract (design.md §3.2): ids in ``[0, vocab_size)`` (int64 inputs
-    are converted to int32 losslessly for vocab < 2^31), ``weight`` row-major
-    contiguous on NPU with ``weight.shape[0] == vocab_end - vocab_start``.
+    Caller contract (design.md §3.2): ids in ``[0, vocab_size)``, ``weight``
+    row-major contiguous on NPU with
+    ``weight.shape[0] == vocab_end - vocab_start``. int32 and int64 ids are both
+    read directly by the kernel (the builder specializes on the ids dtype; the
+    int64 -> int32 narrow is lossless for vocab < 2^31), so no cast kernel is
+    launched for the two common dtypes; other dtypes are cast here.
 
     The kernel works on a flat token axis: for contiguous ids ``reshape(-1)``
-    is a zero-copy view; a non-contiguous input incurs one int32 copy
-    (4 B/token). The wrapper does not synchronize, matching the other Ascend
-    examples; callers own any required stream synchronization.
+    is a zero-copy view; a non-contiguous input incurs one copy
+    (``ids.numel() * ids.element_size()`` bytes). The wrapper does not
+    synchronize, matching the other Ascend examples; callers own any required
+    stream synchronization.
     """
     orig_shape = tuple(input_ids.shape)
     shard_rows, H = weight.shape
@@ -228,14 +238,21 @@ def embedding_lookup(
     if dtype is None:
         raise TypeError(f"unsupported weight dtype: {weight.dtype}")
     # The kernel indexes a flat token axis. For contiguous [B,S] ids this is a
-    # zero-copy view; a non-contiguous input triggers one int32 copy (4 B/token).
+    # zero-copy view; a non-contiguous input triggers one copy (ids.numel() *
+    # ids.element_size() bytes). int32/int64 feed the kernel directly; any
+    # other dtype pays one conversion kernel here.
     ids = input_ids.reshape(-1)
-    if ids.dtype != torch.int32:
+    if ids.dtype == torch.int32:
+        ids_dtype = "int32"
+    elif ids.dtype == torch.int64:
+        ids_dtype = "int64"
+    else:
         ids = ids.to(torch.int32)
+        ids_dtype = "int32"
     if ids.numel() == 0:  # wrapper short-circuit, no kernel launch (design.md §4.4)
         return torch.empty(orig_shape + (H,), device=weight.device, dtype=weight.dtype)
     num_tokens = ids.numel()
-    kernel = embedding_lookup_fwd(num_tokens, shard_rows, H, dtype)
+    kernel = embedding_lookup_fwd(num_tokens, shard_rows, H, dtype, ids_dtype)
     out = kernel(ids, weight, vocab_start_index, vocab_end_index)
     # The block-store path pads the output up to a tile multiple; slicing dim 0
     # keeps the view contiguous, so the reshape below stays zero-copy.

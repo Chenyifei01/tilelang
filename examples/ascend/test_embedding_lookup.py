@@ -7,7 +7,8 @@ address movement, no rounding). C14-C20 are the generalization matrix
 forms, TP shard sums, id patterns, wave boundaries, config invariants);
 C21-C25 add the broad shape/dtype sweeps (20 H values, 12 nt values,
 3 dtypes x 4 input forms, TP=8 x 4 H, fp16/fp32 x 4 H); C26 covers the padded
-block-store path for non-divisible token counts.
+block-store path for non-divisible token counts, C27 the in-kernel int64 ids
+path (contiguous and not).
 """
 
 import hashlib
@@ -537,3 +538,22 @@ def test_c26_padded_block_store(H, nt):
     assert out.shape == (nt, H)
     assert out.is_contiguous()
     assert torch.equal(out, ref_program(ids, w, start, end))
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("form", ["1d", "2d_noncontig"])
+def test_c27_int64_ids_in_kernel(form):
+    """int64 ids are read by the kernel and narrowed in its scalar path, so the
+    wrapper launches no cast kernel for int32/int64. The non-contiguous form
+    additionally exercises the ``reshape(-1)`` materialisation that happens
+    before the kernel sees the ids."""
+    nt, vocab, start, end, H = 64, 32, 8, 24, 256
+    base = _rand_ids(nt, vocab, seed=81).to(torch.int64)
+    ids = base if form == "1d" else base.reshape(8, 8).t()
+    if form != "1d":
+        assert not ids.is_contiguous()
+    w = _rand_weight(end - start, H, seed=82)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.shape == tuple(ids.shape) + (H,)
+    expect = ref_program(ids.reshape(-1), w, start, end).reshape(tuple(ids.shape) + (H,))
+    assert torch.equal(out, expect)
