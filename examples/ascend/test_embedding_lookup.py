@@ -6,7 +6,8 @@ address movement, no rounding). C14-C20 are the generalization matrix
 (row-class boundaries, large H / single-buffer fallback, dtype x H, input
 forms, TP shard sums, id patterns, wave boundaries, config invariants);
 C21-C25 add the broad shape/dtype sweeps (20 H values, 12 nt values,
-3 dtypes x 4 input forms, TP=8 x 4 H, fp16/fp32 x 4 H) for 100 cases total.
+3 dtypes x 4 input forms, TP=8 x 4 H, fp16/fp32 x 4 H); C26 covers the padded
+block-store path for non-divisible token counts.
 """
 
 import hashlib
@@ -518,4 +519,21 @@ def test_c25_dtype_H_sweep(dtype, H):
     w = _rand_weight(end - start, H, dtype, seed=69)
     out = embedding_lookup(ids, w, start, end)
     assert out.dtype == dtype
+    assert torch.equal(out, ref_program(ids, w, start, end))
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("H, nt", [(1024, 1000), (4096, 1000), (7168, 1000), (4096, 1031)])
+def test_c26_padded_block_store(H, nt):
+    """Non-divisible num_tokens with a filled grid takes the padded block-store
+    path: the kernel writes ceil(nt/tile_t)*tile_t rows (the tail tile's ids are
+    clamped by the copy planner, so a pad row is a duplicate or a zero the
+    wrapper slices off) and the wrapper returns ``out[:nt]`` as a contiguous
+    view. Underfilled batches (test_c5/c22) keep the per-row path instead."""
+    vocab, start, end = 64, 8, 56
+    ids = _rand_ids(nt, vocab, seed=71)
+    w = _rand_weight(end - start, H, seed=72)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.shape == (nt, H)
+    assert out.is_contiguous()
     assert torch.equal(out, ref_program(ids, w, start, end))

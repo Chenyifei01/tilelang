@@ -3,15 +3,18 @@
 Design: ``embedding_lookup/design.md``. Pure AIV kernel on the persistent
 execution model: a fixed grid iterates work tiles (``T.Persistent``), each
 tile runs a token-granularity multi-buffered row pipeline (``T.Pipelined``).
-When ``num_tokens`` is divisible by ``tile_t`` (compile-time) the tile's rows
-leave in one block MTE3 (stream-copy transaction shape, design.md §6.3 T8);
-otherwise rows store per-row under a tail guard. For 4-12 KiB rows (the
-V4-Flash class) the miss load is skipped -- a miss row is clamped to an
-L2-resident row and then zeroed, so the read is pure waste; measured -39% at
-TP=8 with TP=1 neutral (design.md §6.3 T9). For >=12 KiB rows the skip is not
-enabled: it regresses TP=1 by ~20% and gains only ~3% at TP=8. Stores remain
-unconditional with respect to hit/miss; conditional MTE *stores* are unsound
-under the auto-scheduler (design.md §9.1 S6), so do not reintroduce them.
+A tile's rows leave in one block MTE3 (stream-copy transaction shape,
+design.md §6.3 T8). When ``num_tokens`` is not a multiple of ``tile_t`` the
+output is padded up to one and the wrapper slices the pad rows off, so the
+block store still runs for every tile (-16% at H=4096, nt=32766); a tiny batch
+whose grid is not filled keeps the per-row path, which starts storing after the
+first row. For 4-12 KiB rows (the V4-Flash class) the miss load is skipped -- a
+miss row is clamped to an L2-resident row and then zeroed, so the read is pure
+waste; measured -39% at TP=8 with TP=1 neutral (design.md §6.3 T9). For >=12 KiB
+rows the skip is not enabled: it regresses TP=1 by ~20% and gains only ~3% at
+TP=8. Stores remain unconditional with respect to hit/miss; conditional MTE
+*stores* are unsound under the auto-scheduler (design.md §9.1 S6), so do not
+reintroduce them.
 """
 
 import argparse
@@ -100,10 +103,17 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
     tiny batches shrink the grid. The AIV count is queried from the device
     (950DT/950PR etc. differ) instead of being hard-coded.
 
-    When ``num_tokens`` is divisible by ``tile_t`` the tail guard is
-    compile-time dead and the tile's rows leave in one block MTE3 (T8: +6% at
-    H=7168, +16% at H=4096 over the per-row store); otherwise the per-row
-    store path is used.
+    A tile's rows leave in one block MTE3 (T8: +6% at H=7168, +16% at H=4096
+    over the per-row store). That path needs the whole tile in range, so when
+    ``num_tokens`` is not a multiple of ``tile_t`` the output is padded up to
+    one and the wrapper returns ``out[:num_tokens]``: the pad rows are written
+    from the planner-clamped tail ids, cost at most ``tile_t-1`` extra rows,
+    and no store becomes conditional (S6 still holds). Padding only pays once
+    the grid is filled (>= one tile per AIV, measured crossover at 512 tokens
+    for 8 KiB rows: per-row 4.98 us vs block 3.72 us); below that the grid is
+    underfilled and a per-row store that starts after the first row beats a
+    block store that waits for the whole tile (nt=128: 2.10 vs 2.39 us), so
+    tiny batches keep the per-row path.
     """
     assert num_tokens > 0 and shard_rows > 0 and H > 0
     esize = 2 if dtype in ("bfloat16", "float16") else 4
@@ -113,15 +123,19 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
     # pipeline can still overlap (-39% at H=4096 TP=8, neutral at TP=1). For
     # >=12 KiB rows it regresses TP=1 by ~20% and gains ~3% at TP=8.
     skip_miss_load = ROW_CLASS_MID <= H * esize < ROW_CLASS_LARGE
-    block_store = num_tokens % tile_t == 0  # no tail tile: block MTE3 is safe
     num_tiles = (num_tokens + tile_t - 1) // tile_t
-    num_cores = min(get_num_vector_cores(), num_tiles)
+    aiv_count = get_num_vector_cores()
+    # Block MTE3 whenever the tile is fully in range (pad the output) and the
+    # grid is filled; otherwise the per-row store wins on tiny batches.
+    block_store = num_tokens % tile_t == 0 or num_tiles >= aiv_count
+    out_rows = num_tiles * tile_t if block_store else num_tokens
+    num_cores = min(aiv_count, num_tiles)
 
     @T.prim_func
     def main(
         Ids: T.Tensor((num_tokens,), "int32"),
         W: T.Tensor((shard_rows, H), dtype),
-        Out: T.Tensor((num_tokens, H), dtype),
+        Out: T.Tensor((out_rows, H), dtype),
         vocab_start: T.int32,
         vocab_end: T.int32,
     ):
@@ -132,9 +146,10 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
             for tile in T.Persistent([num_tiles], num_cores, core_id):
                 t0 = tile * tile_t
                 # Static full-width id tile: the copy planner requires provably
-                # equal src/dst extents (design.md §9.1 S1). The tail tile's
-                # out-of-range lanes are clamped by the planner and masked by
-                # the guard below.
+                # equal src/dst extents (design.md §9.1 S1). A tail tile's
+                # out-of-range lanes are clamped by the planner: with the block
+                # store they only ever write pad rows the wrapper slices off,
+                # and on the per-row path the guard below drops them.
                 T.copy(Ids[t0 : t0 + tile_t], ids_ub)
                 if block_store:
                     for i in T.Pipelined(tile_t, num_stages=num_stages):
@@ -150,9 +165,10 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16"):
                             with T.SimtVF(threads=128):
                                 for j in T.Parallel(H):
                                     row_ub[i, j] = T.cast(0, dtype)
-                    # one block store for the whole tile (tile_t*H contiguous)
+                    # one block store for the whole tile (tile_t*H contiguous);
+                    # out_rows covers the padded tail, so this is unconditional
                     T.copy(row_ub, Out[t0 : t0 + tile_t, :])
-                else:  # block_store is False here; the tail guard below is live
+                else:  # tiny batch on a non-divisible token count; guard is live
                     for i in T.Pipelined(tile_t, num_stages=num_stages):
                         tk = t0 + i
                         if tk < num_tokens:  # tail-tile guard
@@ -218,9 +234,12 @@ def embedding_lookup(
         ids = ids.to(torch.int32)
     if ids.numel() == 0:  # wrapper short-circuit, no kernel launch (design.md §4.4)
         return torch.empty(orig_shape + (H,), device=weight.device, dtype=weight.dtype)
-    kernel = embedding_lookup_fwd(ids.numel(), shard_rows, H, dtype)
+    num_tokens = ids.numel()
+    kernel = embedding_lookup_fwd(num_tokens, shard_rows, H, dtype)
     out = kernel(ids, weight, vocab_start_index, vocab_end_index)
-    return out.reshape(orig_shape + (H,))
+    # The block-store path pads the output up to a tile multiple; slicing dim 0
+    # keeps the view contiguous, so the reshape below stays zero-copy.
+    return out[:num_tokens].reshape(orig_shape + (H,))
 
 
 def run_regression_perf(
@@ -272,3 +291,6 @@ if __name__ == "__main__":
         # TP=8 simulation: local shard 16160, global ids 129280 -> 12.5% hit,
         # exercising the miss-read skip on the 4-12 KiB row class.
         run_regression_perf(H=4096, vocab_size=16160, id_vocab_size=129280)
+        # Non-divisible token count: 32766 % 8 != 0 takes the padded block-store
+        # path, which must match run_regression_perf(H=4096) above.
+        run_regression_perf(num_tokens=32766, H=4096, vocab_size=16160, id_vocab_size=129280)
