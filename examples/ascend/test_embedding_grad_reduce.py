@@ -277,16 +277,23 @@ def test_c15_aten_autograd_equivalence():
 
 def test_c14_pipeline_config_table():
     """Host-only config invariants (UB budget, minimum depth, large-H guard)."""
-    assert _pipeline_config(7168, 2, 4) == (4, 4)
-    assert _pipeline_config(4096, 2, 4) == (4, 4)
-    assert _pipeline_config(7168, 4, 4) == (3, 3)
+    # Production bf16->fp32: four source versions, two accumulator versions and a
+    # two-deep fold source all fit at H=7168.
+    assert _pipeline_config(7168, 2, 4) == (4, 2, 2, 4)
+    assert _pipeline_config(4096, 2, 4) == (4, 2, 2, 4)
+    # fp32 source: the main source drops to three versions, fold source to two.
+    assert _pipeline_config(7168, 4, 4) == (3, 2, 2, 3)
     for H in [1, 8, 64, 255, 256, 1024, 2048, 4095, 4096, 7168, 8192]:
         for esize_src, esize_acc in [(2, 4), (4, 4), (2, 2)]:
-            versions, stages = _pipeline_config(H, esize_src, esize_acc)
-            assert versions >= 2 and stages == versions
-            assert versions * H * (esize_src + esize_acc) <= UB_PLAN, (H, esize_src, esize_acc)
+            src_v, acc_v, src2_v, stages = _pipeline_config(H, esize_src, esize_acc)
+            assert src_v >= 2 and src2_v >= 1 and acc_v == 2 and stages == src_v
+            assert (src_v + src2_v) * H * esize_src + acc_v * H * esize_acc <= UB_PLAN, (
+                H,
+                esize_src,
+                esize_acc,
+            )
     with pytest.raises(AssertionError):
-        _pipeline_config(32768, 4, 4)  # two fp32 row versions cannot fit UB
+        _pipeline_config(32768, 4, 4)  # two fp32 source rows alone cannot fit UB
 
 
 # ---------------------------------------------------------------------------
@@ -510,9 +517,23 @@ def test_c27_shard_padding_scale_matrix(padding_idx, scale):
 @tilelang.testing.requires_ascend
 @pytest.mark.parametrize("H", [7168, 8192])
 def test_c28_fp32_large_hidden(H):
-    """fp32 input at production width: 3 buffer versions (not 4) must fit UB."""
+    """fp32 input at production width: the row pipeline must degrade its version
+    counts (rather than fail) and stay bit-exact."""
     vocab, nt = 16, 32
     ids = _rand_ids(nt, vocab, seed=62)
     go = _rand_grad(nt, H, torch.float32, seed=63)
     got = embedding_grad_reduce(go, ids, vocab)
     _assert_rows(got, _expect(go, ids, vocab), tol=1e-6)
+
+
+@tilelang.testing.requires_ascend
+def test_c29_fold_across_drains():
+    """More hits per core than DRAIN_CAP: a repeat folds only into a plain store
+    from its own drain, and a row first stored by an earlier drain falls back to
+    the atomic add."""
+    vocab, H = 131072, 64
+    nt = 3 * 56 * 1024  # ~3 drains per core at 56 AIVs, well past DRAIN_CAP
+    ids = _rand_ids(nt, vocab, seed=64)
+    go = _rand_grad(nt, H, seed=65)
+    got = embedding_grad_reduce(go, ids, vocab)
+    _assert_rows(got, _expect(go, ids, vocab), tol=1e-5)
