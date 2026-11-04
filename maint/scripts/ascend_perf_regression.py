@@ -104,6 +104,12 @@ _ENTRIES: list[tuple[str, str, dict]] = [
     ("ascend_gqa", "flash_attention/example_gqa.py", {}),
     ("ascend_gqa_bwd", "flash_attention/example_gqa_bwd.py", {}),
     ("ascend_rmsnorm", "example_rmsnorm.py", {}),
+    ("ascend_embedding_grad_reduce", "example_embedding_grad_reduce.py", {}),
+    (
+        "ascend_embedding_grad_reduce_shard",
+        "example_embedding_grad_reduce.py:run_sharded_perf",
+        {},
+    ),
     ("ascend_simtvf_vecadd", "example_vecadd.py", {"mode": "simt"}),
     ("ascend_simdvf_vecadd_lower", "example_vecadd.py", {"mode": "simd"}),
     ("ascend_simdvf_per_token_cast_to_fp8", "example_per_token_cast_to_fp8.py", {"mode": "simd"}),

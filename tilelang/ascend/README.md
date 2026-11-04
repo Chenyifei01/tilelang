@@ -224,7 +224,9 @@ atomic and deterministic reduction across cores.
 
 The vector examples cover [SIMT and SIMD addition](../../examples/ascend/example_vecadd.py),
 [SIMT RMSNorm](../../examples/ascend/example_rmsnorm.py),
-and [SIMT and SIMD FP8 quantization](../../examples/ascend/example_per_token_cast_to_fp8.py).
+[SIMT and SIMD FP8 quantization](../../examples/ascend/example_per_token_cast_to_fp8.py),
+and a [vocab-parallel scatter-add](../../examples/ascend/example_embedding_grad_reduce.py)
+with SIMD compaction, dual write strategies and folded duplicate repeats.
 [FlashAttention](../../examples/ascend/flash_attention/README.md) contains the
 attention implementations.
 

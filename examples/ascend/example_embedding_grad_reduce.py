@@ -1,6 +1,6 @@
 """Vocab-parallel embedding gradient reduce (scatter-add) for Ascend NPUs.
 
-Design: ``embedding_grad_reduce/design.md``. ``embedding_lookup`` gathers rows;
+Design: ``README.md`` (Embedding gradient reduce). ``embedding_lookup`` gathers rows;
 this operator is its reverse: for every token position ``j`` it accumulates
 ``grad_output[j]`` into row ``indices[j]`` of the embedding-gradient table,
 so repeated ids add up. The table lives in global memory across the whole run
@@ -60,7 +60,7 @@ import tilelang.ascend.language as T
 from tilelang.ascend.language import simd as S
 from tilelang.profiler import do_bench
 
-# Measured AIV count on Ascend 950DT (embedding_lookup design.md §1.4).
+# Measured AIV count on Ascend 950DT.
 NUM_AIV = 56
 # UB envelope used for the row pipeline; the hardware limit is ~216 KiB with a
 # VF region, and the scheduler needs headroom for flags/reservations.
@@ -717,7 +717,8 @@ def ref_program(grad_output, indices, num_weights, padding_idx=-1, scale_grad_by
 
     Ids outside ``[vocab_start_index, vocab_end_index)`` and the padding row
     contribute nothing. ``scale_grad_by_freq`` divides by the count of valid
-    occurrences (README §3 golden). Duplicate ids accumulate.
+    occurrences (the golden is ATen `embedding_dense_backward`). Duplicate ids
+    accumulate.
     """
     grad_output = grad_output.reshape(-1, grad_output.shape[-1])
     idx = indices.reshape(-1)
@@ -907,7 +908,7 @@ if __name__ == "__main__":
         "--bench", action=argparse.BooleanOptionalAction, default=True, help="benchmark after correctness checks"
     )
     args = parser.parse_args()
-    # Sharded scenario with duplicate ids and padding (README §6 checklist).
+    # Sharded scenario with duplicate ids and padding.
     num_tokens, vocab_size, vocab_start, vocab_end, H = 4096, 8192, 512, 4608, 4096
     torch.manual_seed(0)
     ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int32).npu()

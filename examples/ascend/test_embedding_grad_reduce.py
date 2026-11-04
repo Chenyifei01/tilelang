@@ -1,6 +1,7 @@
 """Correctness tests for the vocab-parallel embedding gradient reduce example.
 
-Cases map to ``embedding_grad_reduce/design.md`` §6 (README §6 checklist).
+Cases cover the operator contract: golden semantics, shard boundaries, both
+write strategies and the duplicate-fold path.
 Rows that receive exactly one contribution are bit-exact (the hardware atomic
 adds that value to a zero row); rows with repeated ids accumulate in an
 unspecified order, so those cases compare with an fp32 tolerance.
@@ -133,7 +134,7 @@ def test_c7_int64_and_2d_indices():
 
 @tilelang.testing.requires_ascend
 def test_c8_scale_grad_by_freq():
-    """Each occurrence is divided by id_count (README §3 golden)."""
+    """Each occurrence is divided by id_count (ATen embedding_dense_backward)."""
     vocab, H = 24, 64
     ids = _rand_ids(80, vocab, seed=14)
     ids = torch.cat([ids, ids[:16]])  # create frequency > 1

@@ -700,6 +700,7 @@ with one matching test per example. Use DeepGEMM for advanced matrix kernels:
 | SIMT and explicit SIMD vector addition with pipelined copies | `example_vecadd.py` |
 | SIMT reduction and normalization | `example_rmsnorm.py` |
 | SIMT and SIMD group-wise FP8 quantization | `example_per_token_cast_to_fp8.py` |
+| Vocab-parallel scatter-add: SIMD compaction, row/token partitions, folded duplicate repeats | `example_embedding_grad_reduce.py` |
 | MHA / GQA | `flash_attention/example_mha.py` / `flash_attention/example_gqa.py` |
 | Explicit pipeline stages in attention | `flash_attention/example_gqa_manual_schedule.py` |
 
