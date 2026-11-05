@@ -254,6 +254,10 @@ def test_c13_wrapper_contract_rejects():
         # int table: unsupported dtype rejected. (torch.float64 is silently cast
         # to float32 by the NPU device itself, so it cannot probe this path.)
         embedding_lookup(ids, w.to(torch.int32), 0, 16)
+    with pytest.raises(ValueError):
+        embedding_lookup(ids.reshape(2, 4).t(), w, 0, 16)  # non-contiguous ids
+    with pytest.raises(TypeError):
+        embedding_lookup(ids.to(torch.float32), w, 0, 16)  # unsupported ids dtype
 
 
 # --------------------------------------------------------------------------
@@ -317,7 +321,9 @@ def test_c16_input_forms():
 
     ids2 = _rand_ids(64, vocab, seed=43).reshape(2, 32).t()  # [32,2], non-contiguous
     assert not ids2.is_contiguous()
-    out2 = embedding_lookup(ids2, w, start, end)
+    with pytest.raises(ValueError):  # strict default: no hidden copy
+        embedding_lookup(ids2, w, start, end)
+    out2 = embedding_lookup(ids2, w, start, end, strict=False)
     assert out2.shape == (32, 2, H)
     assert torch.equal(out2, ref_program(ids2.reshape(-1), w, start, end).reshape(32, 2, H))
 
@@ -527,18 +533,20 @@ def test_c25_dtype_H_sweep(dtype, H):
 
 @tilelang.testing.requires_ascend
 @pytest.mark.parametrize("H, nt", [(1024, 1000), (4096, 1000), (7168, 1000), (4096, 1031)])
-def test_c26_padded_block_store(H, nt):
-    """Non-divisible num_tokens with a filled grid takes the padded block-store
-    path: the kernel writes ceil(nt/tile_t)*tile_t rows (the tail tile's ids are
-    clamped by the copy planner, so a pad row is a duplicate or a zero the
-    wrapper slices off) and the wrapper returns ``out[:nt]`` as a contiguous
-    view. Underfilled batches (test_c5/c22) keep the per-row path instead."""
+def test_c26_tail_block_store(H, nt):
+    """Non-divisible num_tokens with a filled grid: the full tiles leave as one
+    block MTE3 each and the <= tile_t-1 leftover rows are stored one per core
+    after the persistent loop, so the output is exactly ``nt`` rows (storage ==
+    nt*H, no pad buffer to slice off) and every store is as wide as its
+    destination (design.md §4.3). Underfilled batches (C5/C22) take the
+    per-row path instead."""
     vocab, start, end = 64, 8, 56
     ids = _rand_ids(nt, vocab, seed=71)
     w = _rand_weight(end - start, H, seed=72)
     out = embedding_lookup(ids, w, start, end)
     assert out.shape == (nt, H)
     assert out.is_contiguous()
+    assert out.untyped_storage().nbytes() == nt * H * w.element_size()  # no pad rows
     assert torch.equal(out, ref_program(ids, w, start, end))
 
 
@@ -555,7 +563,7 @@ def test_c27_int64_ids_in_kernel(form):
     if form != "1d":
         assert not ids.is_contiguous()
     w = _rand_weight(end - start, H, seed=82)
-    out = embedding_lookup(ids, w, start, end)
+    out = embedding_lookup(ids, w, start, end, strict=(form == "1d"))
     assert out.shape == tuple(ids.shape) + (H,)
     expect = ref_program(ids.reshape(-1), w, start, end).reshape(tuple(ids.shape) + (H,))
     assert torch.equal(out, expect)
