@@ -115,11 +115,12 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
     one and the wrapper returns ``out[:num_tokens]``: the pad rows are written
     from the planner-clamped tail ids, cost at most ``tile_t-1`` extra rows,
     and no store becomes conditional (S6 still holds). Padding only pays once
-    the grid is filled (>= one tile per AIV, measured crossover at 512 tokens
-    for 8 KiB rows: per-row 4.98 us vs block 3.72 us); below that the grid is
+    the grid is filled (>= one tile per AIV; measured crossover at 512 tokens
+    for 8 KiB rows: per-row 7.52 us vs block 4.59 us); below that the grid is
     underfilled and a per-row store that starts after the first row beats a
-    block store that waits for the whole tile (nt=128: 2.10 vs 2.39 us), so
-    tiny batches keep the per-row path.
+    block store that waits for the whole tile (nt=128: 2.41 vs 2.81 us), so
+    tiny batches keep the per-row path even when ``num_tokens`` is a tile
+    multiple (design.md §6.3 T16).
     """
     assert num_tokens > 0 and shard_rows > 0 and H > 0
     esize = 2 if dtype in ("bfloat16", "float16") else 4
@@ -131,9 +132,13 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
     skip_miss_load = ROW_CLASS_MID <= H * esize < ROW_CLASS_LARGE
     num_tiles = (num_tokens + tile_t - 1) // tile_t
     aiv_count = get_num_vector_cores()
-    # Block MTE3 whenever the tile is fully in range (pad the output) and the
-    # grid is filled; otherwise the per-row store wins on tiny batches.
-    block_store = num_tokens % tile_t == 0 or num_tiles >= aiv_count
+    # Block MTE3 once the grid is filled (one tile per AIV or more); the
+    # measured crossover is exactly grid fill. Below it the per-row store wins
+    # even for divisible num_tokens: with a single tile per core, a block store
+    # that waits for the whole tile loses to a per-row store that starts after
+    # the first row (nt=128 @H=4096: 2.41 vs 2.81 us; nt=512 with 64 tiles:
+    # 4.59 vs 7.52 us, design.md §6.3 T16).
+    block_store = num_tiles >= aiv_count
     out_rows = num_tiles * tile_t if block_store else num_tokens
     num_cores = min(aiv_count, num_tiles)
 

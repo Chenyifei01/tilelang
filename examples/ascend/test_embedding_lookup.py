@@ -8,7 +8,8 @@ forms, TP shard sums, id patterns, wave boundaries, config invariants);
 C21-C25 add the broad shape/dtype sweeps (20 H values, 12 nt values,
 3 dtypes x 4 input forms, TP=8 x 4 H, fp16/fp32 x 4 H); C26 covers the padded
 block-store path for non-divisible token counts, C27 the in-kernel int64 ids
-path (contiguous and not).
+path (contiguous and not), C29 the per-row store for divisible tiny batches
+(underfilled grid).
 """
 
 import hashlib
@@ -162,21 +163,22 @@ def test_c9_compile_cache_reuse():
 @pytest.mark.parametrize(
     "H, nt",
     [
-        (256, 64),   # unconditional-load class (small rows)
-        (4096, 64),  # conditional miss-load class, block store
-        (4096, 66),  # conditional miss-load class, per-row tail guard
-        (7168, 64),  # unconditional-load class, block store
-        (7168, 66),  # unconditional-load class, per-row tail guard
+        (256, 1024),   # unconditional-load class, block store (grid filled)
+        (4096, 1024),  # conditional miss-load class, block store
+        (4096, 66),    # conditional miss-load class, per-row tail guard
+        (7168, 1024),  # unconditional-load class, block store
+        (7168, 66),    # unconditional-load class, per-row tail guard
     ],
 )
 def test_c10_repeat_compile_regression(H, nt, monkeypatch):
     """Gate against schedule variance (design.md §8.1 C10 / §9.1 S6): repeated
     compiles of the same source must all be bit-exact; the per-compile source
     hash is recorded so a failure attributes to a specific binary. Covers both
-    store paths (design.md §4.3): nt divisible by tile_t -> block store, else
-    per-row with the tail guard active. The kernel disk cache is disabled so
-    every rep is a genuine recompile -- with the cache on, reps 2+ would be
-    cache hits and gate nothing."""
+    store paths (design.md §4.3): a filled grid (num_tiles >= AIV) uses the
+    block store, an underfilled one the per-row store with the tail guard
+    active. The kernel disk cache is disabled so every rep is a genuine
+    recompile -- with the cache on, reps 2+ would be cache hits and gate
+    nothing."""
     monkeypatch.setenv("TILELANG_DISABLE_CACHE", "1")
     shard_rows, vocab, vocab_start, vocab_end = 16, 32, 3, 19
     for rep in range(3):
@@ -557,3 +559,20 @@ def test_c27_int64_ids_in_kernel(form):
     assert out.shape == tuple(ids.shape) + (H,)
     expect = ref_program(ids.reshape(-1), w, start, end).reshape(tuple(ids.shape) + (H,))
     assert torch.equal(out, expect)
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("H, nt", [(4096, 128), (7168, 64), (7168, 128)])
+def test_c29_tiny_divisible_batch(H, nt):
+    """A divisible tiny batch keeps the per-row store: the grid is underfilled
+    (fewer tiles than AIVs), and there a per-row store that starts after the
+    first row beats a block store that waits for the whole tile (nt=128 @H=4096:
+    2.41 vs 2.81 us; design.md §6.3 T16). The kernel output is exactly ``nt``
+    rows on that path, i.e. the wrapper does not slice a padded buffer."""
+    vocab, start, end = 64, 8, 56
+    ids = _rand_ids(nt, vocab, seed=101)
+    w = _rand_weight(end - start, H, seed=102)
+    out = embedding_lookup(ids, w, start, end)
+    assert out.shape == (nt, H)
+    assert out.untyped_storage().nbytes() == nt * H * w.element_size()  # no pad rows
+    assert torch.equal(out, ref_program(ids, w, start, end))
