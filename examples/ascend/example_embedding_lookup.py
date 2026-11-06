@@ -9,11 +9,11 @@ allocates the output at its exact size; the partial tail tile (a compile-time
 constant number of rows) is stored by one extra single-row store per involved
 core, so no pad rows are written and no host-side reshape/pad/slice is needed
 (design.md §4.3). A tiny batch whose grid is not filled keeps the per-row path,
-which starts storing after the first row. For 4-12 KiB rows (the V4-Flash class) the miss load is skipped -- a
-miss row is clamped to an L2-resident row and then zeroed, so the read is pure
-waste; measured -39% at TP=8 with TP=1 neutral (design.md §6.3 T9). For >=12 KiB
-rows the skip is not enabled: it regresses TP=1 by ~20% and gains only ~3% at
-TP=8. Stores remain unconditional with respect to hit/miss; conditional MTE
+which starts storing after the first row. A miss row is never read -- clamping
+it to an L2-resident row only to zero it is pure waste -- so the load is
+skipped for every row class and the zero fill writes the row instead (measured
+-39% at H=4096 TP=8, neutral at TP=1, -19% at nt=2048 H=7168; design.md §6.3
+T9/T24). Stores remain unconditional with respect to hit/miss; conditional MTE
 *stores* are unsound under the auto-scheduler (design.md §9.1 S6), so do not
 reintroduce them.
 """
@@ -36,7 +36,7 @@ UB_PHYSICAL = 248 * 1024
 SIMT_VF_CONTEXT = 32 * 1024
 UB_PLAN = UB_PHYSICAL - SIMT_VF_CONTEXT  # 216 KiB
 
-# Row-byte class boundaries shared by _tile_config and skip_miss_load.
+# Row-byte class boundaries for _tile_config.
 ROW_CLASS_MID = 4 * 1024
 ROW_CLASS_LARGE = 12 * 1024
 
@@ -147,10 +147,12 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
         aiv_count = get_num_vector_cores()
     tile_t, versions, num_stages = _tile_config(H, esize)
     # A miss reads a clamped L2-resident row and then zeroes it: the read is
-    # waste. Skipping it pays off only for 4-12 KiB rows, where the fill/store
-    # pipeline can still overlap (-39% at H=4096 TP=8, neutral at TP=1). For
-    # >=12 KiB rows it regresses TP=1 by ~20% and gains ~3% at TP=8 (T9/T14).
-    skip_miss_load = ROW_CLASS_MID <= H * esize < ROW_CLASS_LARGE
+    # pure waste, so only hit rows are loaded. Measured neutral at TP=1 and at
+    # large batches (-0.4% at nt=32768) and dominant at medium batches, where
+    # the per-tile read latency cannot be hidden: nt=2048 TP=8 H=7168 drops
+    # 16.1 -> 13.0 us (-19%). The old "4-12 KiB rows only" gate came from a
+    # build where the TP=1 regression was real; it does not reproduce
+    # (331.0 vs 331.5 us), so the gate is gone (T24).
     num_tiles = (num_tokens + tile_t - 1) // tile_t
     full_tiles = num_tokens // tile_t
     tail_rows = num_tokens - full_tiles * tile_t  # compile-time, 0..tile_t-1
@@ -200,10 +202,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
                         tok_id = T.cast(ids_ub[i], "int32")  # no-op for int32 ids
                         local = tok_id - vocab_start
                         hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
-                        if skip_miss_load:  # 4-12 KiB rows: miss read is waste
-                            if hit:
-                                T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
-                        else:
+                        if hit:  # miss rows are zeroed below, never read (T24)
                             T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
                         if not hit:  # miss: vectorized zero (V pipe)
                             with T.SimtVF(threads=128):
@@ -222,10 +221,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
                         tok_id = T.cast(tail_ids[0], "int32")
                         local = tok_id - vocab_start
                         hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
-                        if skip_miss_load:
-                            if hit:
-                                T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], tail_ub[0, :])
-                        else:
+                        if hit:
                             T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], tail_ub[0, :])
                         if not hit:
                             with T.SimtVF(threads=128):
@@ -242,10 +238,7 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
                             tok_id = T.cast(ids_ub[i], "int32")  # no-op for int32
                             local = tok_id - vocab_start
                             hit = (tok_id >= vocab_start) and (tok_id < vocab_end)
-                            if skip_miss_load:  # 4-12 KiB rows: miss read is waste
-                                if hit:
-                                    T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
-                            else:
+                            if hit:  # miss rows are zeroed below, never read (T24)
                                 T.copy(W[T.min(T.max(local, 0), shard_rows - 1), :], row_ub[i, :])
                             if not hit:  # miss: vectorized zero (V pipe)
                                 with T.SimtVF(threads=128):
