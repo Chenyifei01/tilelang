@@ -193,7 +193,13 @@ def embedding_lookup_fwd(num_tokens, shard_rows, H, dtype="bfloat16", ids_dtype=
             if block_store:
                 # Full tiles only; the partial tail is handled below so that
                 # every store is exactly as wide as its destination rows.
-                for tile in T.Persistent([full_tiles], num_cores, core_id):
+                # enable_offset lets the Z3 scheduler put the block store in a
+                # later stage than the row work instead of collapsing every task
+                # into stage 0 (with it off, num_stages only buys buffer
+                # versions). Worth -1% at TP=1 and TP=8 large batches and -7% at
+                # nt=2048, where the per-tile latency dominates (T25).
+                for tile in T.Persistent([full_tiles], num_cores, core_id, num_stages=2,
+                                         annotations={"enable_offset": True}):
                     t0 = tile * tile_t
                     # Static full-width id tile: the copy planner requires
                     # provably equal src/dst extents (design.md §9.1 S1).
